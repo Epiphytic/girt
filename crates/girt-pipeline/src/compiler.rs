@@ -45,7 +45,7 @@ version = "{version}"
 edition = "2024"
 
 [dependencies]
-wit-bindgen = "0.41"
+wit-bindgen-rt = {{ version = "0.44.0", features = ["bitflags"] }}
 serde = {{ version = "1", features = ["derive"] }}
 serde_json = "1"
 
@@ -53,7 +53,13 @@ serde_json = "1"
 crate-type = ["cdylib"]
 
 [package.metadata.component]
-package = "girt:tool@0.1.0"
+package = "girt:tool"
+
+[package.metadata.component.target]
+world = "girt-tool"
+path = "wit"
+
+[package.metadata.component.dependencies]
 "#,
             name = package_name,
             version = input.tool_version,
@@ -62,7 +68,12 @@ package = "girt:tool@0.1.0"
 
         std::fs::write(project_dir.join("src/lib.rs"), &input.source_code)?;
 
-        std::fs::write(project_dir.join("wit/world.wit"), &input.wit_definition)?;
+        // Strip version suffix from WIT package line if present.
+        // cargo-component v0.21 does not support versioned package names.
+        let wit = input
+            .wit_definition
+            .replace("package girt:tool@0.1.0;", "package girt:tool;");
+        std::fs::write(project_dir.join("wit/world.wit"), wit)?;
 
         Ok(project_dir)
     }
@@ -172,10 +183,10 @@ mod tests {
 
         let input = CompileInput {
             source_code: r#"
-wit_bindgen::generate!({
-    world: "girt-tool",
-    path: "wit",
-});
+#[allow(warnings)]
+mod bindings;
+
+use bindings::Guest;
 
 struct Component;
 
@@ -185,11 +196,11 @@ impl Guest for Component {
     }
 }
 
-export!(Component);
+bindings::export!(Component with_types_in bindings);
 "#
             .into(),
             wit_definition: r#"
-package girt:tool@0.1.0;
+package girt:tool;
 
 world girt-tool {
     export run: func(input: string) -> result<string, string>;

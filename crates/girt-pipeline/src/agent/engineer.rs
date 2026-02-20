@@ -1,0 +1,168 @@
+use crate::error::PipelineError;
+use crate::llm::{LlmClient, LlmMessage, LlmRequest};
+use crate::types::{BugTicket, BuildOutput, PolicyYaml, RefinedSpec};
+
+const ENGINEER_SYSTEM_PROMPT: &str = r#"You are a Senior Backend Engineer. You write functions that compile to wasm32-wasi Components and run inside a Wasmtime sandbox via Wassette.
+
+Target: WebAssembly Component Model with WIT interface definitions.
+
+Environment Constraints:
+- No local filesystem access unless explicitly granted in the spec.
+- No native network access. Use WASI HTTP for outbound calls.
+- Network access is restricted to hosts listed in the spec's constraints.
+- SECRETS: Never hardcode credentials. Call host_auth_proxy(service_name) to get authenticated responses.
+
+Output ONLY valid JSON in this exact format:
+{
+  "source_code": "// Full Rust source code here",
+  "wit_definition": "// WIT interface here",
+  "policy_yaml": "// Wassette policy YAML here",
+  "language": "rust"
+}
+
+Do not include any text outside the JSON object. Do not use markdown code fences."#;
+
+const ENGINEER_FIX_PROMPT: &str = r#"You previously built a WASM component that had issues. Fix the code based on the bug ticket below.
+
+Output ONLY the complete fixed code in the same JSON format as before:
+{
+  "source_code": "// Fixed Rust source code",
+  "wit_definition": "// WIT interface (may be unchanged)",
+  "policy_yaml": "// Wassette policy YAML (may be unchanged)",
+  "language": "rust"
+}"#;
+
+/// The Engineer agent generates WASM Component source code from the
+/// Architect's refined spec.
+pub struct EngineerAgent<'a> {
+    llm: &'a dyn LlmClient,
+}
+
+impl<'a> EngineerAgent<'a> {
+    pub fn new(llm: &'a dyn LlmClient) -> Self {
+        Self { llm }
+    }
+
+    /// Generate initial code from a refined spec.
+    pub async fn build(&self, spec: &RefinedSpec) -> Result<BuildOutput, PipelineError> {
+        let spec_json = serde_json::to_string_pretty(spec)
+            .map_err(|e| PipelineError::LlmError(format!("Failed to serialize spec: {e}")))?;
+
+        let request = LlmRequest {
+            system_prompt: ENGINEER_SYSTEM_PROMPT.into(),
+            messages: vec![LlmMessage {
+                role: "user".into(),
+                content: format!("Implement this tool spec as a WASM Component:\n\n{spec_json}"),
+            }],
+            max_tokens: 4000,
+        };
+
+        let response = self.llm.chat(&request).await?;
+        self.parse_build_output(&response.content, spec)
+    }
+
+    /// Fix code based on a bug ticket.
+    pub async fn fix(
+        &self,
+        spec: &RefinedSpec,
+        previous_output: &BuildOutput,
+        ticket: &BugTicket,
+    ) -> Result<BuildOutput, PipelineError> {
+        let ticket_json = serde_json::to_string_pretty(ticket)
+            .map_err(|e| PipelineError::LlmError(format!("Failed to serialize ticket: {e}")))?;
+
+        let request = LlmRequest {
+            system_prompt: ENGINEER_FIX_PROMPT.into(),
+            messages: vec![LlmMessage {
+                role: "user".into(),
+                content: format!(
+                    "Original spec:\n{}\n\nPrevious code:\n{}\n\nBug ticket:\n{}",
+                    serde_json::to_string_pretty(spec).unwrap_or_default(),
+                    previous_output.source_code,
+                    ticket_json,
+                ),
+            }],
+            max_tokens: 4000,
+        };
+
+        let response = self.llm.chat(&request).await?;
+        self.parse_build_output(&response.content, spec)
+    }
+
+    fn parse_build_output(
+        &self,
+        raw: &str,
+        spec: &RefinedSpec,
+    ) -> Result<BuildOutput, PipelineError> {
+        // Try parsing as JSON first
+        if let Ok(output) = serde_json::from_str::<BuildOutput>(raw) {
+            return Ok(output);
+        }
+
+        // If JSON parsing fails, generate a policy.yaml from the spec and
+        // treat the response as raw source code
+        let policy = PolicyYaml::from_spec(&spec.spec);
+        let policy_yaml = serde_json::to_string_pretty(&policy).unwrap_or_default();
+
+        tracing::warn!("Engineer response was not valid JSON, treating as raw source code");
+        Ok(BuildOutput {
+            source_code: raw.to_string(),
+            wit_definition: String::new(),
+            policy_yaml,
+            language: "rust".into(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::StubLlmClient;
+    use crate::types::SpecAction;
+    use girt_core::spec::{CapabilityConstraints, CapabilitySpec};
+
+    fn make_refined_spec() -> RefinedSpec {
+        RefinedSpec {
+            action: SpecAction::Build,
+            spec: CapabilitySpec {
+                name: "temp_convert".into(),
+                description: "Convert temperature units".into(),
+                inputs: serde_json::json!({"value": "f64", "from": "string", "to": "string"}),
+                outputs: serde_json::json!({"result": "f64"}),
+                constraints: CapabilityConstraints::default(),
+            },
+            design_notes: "Simple stateless conversion".into(),
+            extend_target: None,
+            extend_features: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn builds_from_valid_json_response() {
+        let response = serde_json::json!({
+            "source_code": "fn convert(value: f64) -> f64 { value * 1.8 + 32.0 }",
+            "wit_definition": "package temp:convert;",
+            "policy_yaml": "version: \"1.0\"",
+            "language": "rust"
+        });
+
+        let client = StubLlmClient::constant(&response.to_string());
+        let agent = EngineerAgent::new(&client);
+        let spec = make_refined_spec();
+
+        let output = agent.build(&spec).await.unwrap();
+        assert_eq!(output.language, "rust");
+        assert!(output.source_code.contains("convert"));
+    }
+
+    #[tokio::test]
+    async fn handles_non_json_response_gracefully() {
+        let client = StubLlmClient::constant("fn convert() { /* raw code */ }");
+        let agent = EngineerAgent::new(&client);
+        let spec = make_refined_spec();
+
+        let output = agent.build(&spec).await.unwrap();
+        assert!(output.source_code.contains("raw code"));
+        assert_eq!(output.language, "rust");
+    }
+}

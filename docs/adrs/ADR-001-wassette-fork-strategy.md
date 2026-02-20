@@ -1,8 +1,13 @@
 # ADR-001: Wassette Fork Strategy
 
-**Status:** Accepted
+**Status:** Superseded by [ADR-010](./ADR-010-embedded-wasm-runtime.md)
 **Date:** 2026-02-20
+**Superseded:** 2026-02-20
 **Context:** When and why to fork Microsoft's Wassette runtime
+
+> **Note:** This ADR assumed Wassette would be used as an external subprocess dependency.
+> That approach was abandoned in favour of an embedded `girt-runtime` crate that ports
+> Wassette's execution core directly. See ADR-010 for the current decision.
 
 ---
 

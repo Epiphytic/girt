@@ -11,14 +11,14 @@
 
 GIRT is a **multi-agent tool factory** that dynamically generates, tests, and publishes sandboxed WebAssembly tools on demand. It applies the Hookwise tri-state decision pipeline to both **tool creation** and **tool execution**, ensuring that every capability an LLM agent acquires is policy-checked, functionally verified, and security-audited before use.
 
-GIRT does **not** build its own runtime or sandbox. It sits as an **MCP proxy** in front of [Wassette](https://github.com/microsoft/wassette) (Microsoft's security-oriented WASM runtime for MCP), delegating all sandboxed execution to Wassette's Wasmtime engine and policy system. GIRT owns the build pipeline and decision logic; Wassette owns the execution boundary.
+GIRT embeds its own WASM execution runtime (`girt-runtime`), derived from [Wassette](https://github.com/microsoft/wassette)'s execution core (MIT licensed). GIRT owns both the build pipeline and the execution boundary. The `girt-runtime` crate provides dynamic component loading, Wasmtime sandboxing, WIT introspection, and policy enforcement — all in-process with no external subprocess dependency.
 
 ### Core Principles
 
 1. **Build, don't bundle.** The Operator agent has no static tools. When it needs a capability, it requests one. The pipeline either finds an existing match or builds it.
 2. **Decide like Hookwise.** Every tool creation and execution passes through a cached decision cascade with tri-state outcomes (Allow, Deny, Ask) and HITL escalation.
 3. **Design for reuse.** The Architect refines every capability request into a generic, composable tool spec before any code is written. Tools are built for the ecosystem, not just the immediate task.
-4. **Defense in depth.** Wassette provides runtime sandboxing. GIRT provides pre-deployment assurance (functional testing + adversarial security audit). Both layers are active simultaneously.
+4. **Defense in depth.** `girt-runtime` provides Wasmtime sandboxing at execution time. GIRT provides pre-deployment assurance (functional testing + adversarial security audit). Both layers are active simultaneously.
 5. **Publish and reuse.** Passing tools are pushed to OCI registries. The Epiphytic org maintains a curated public registry and a private internal registry. Users can configure additional registries.
 
 ---
@@ -70,13 +70,13 @@ GIRT does **not** build its own runtime or sandbox. It sits as an **MCP proxy** 
 │  │        │                                                      │   │
 │  │        ▼                                                      │   │
 │  │  ┌───────────┐                                                │   │
-│  │  │ QA Agent  │ Functional test suite against Wassette sandbox │   │
+│  │  │ QA Agent  │ Functional test suite against girt-runtime sandbox │   │
 │  │  │ (LLM)    │ Outputs Bug Ticket on failure → loops to Eng.   │   │
 │  │  └─────┬─────┘                                                │   │
 │  │        │                                                      │   │
 │  │        ▼                                                      │   │
 │  │  ┌───────────┐                                                │   │
-│  │  │ Red Team  │ Adversarial exploitation in Wassette sandbox   │   │
+│  │  │ Red Team  │ Adversarial exploitation in girt-runtime sandbox   │   │
 │  │  │ (LLM)    │ Outputs Bug Ticket on vuln found → loops to Eng│   │
 │  │  └─────┬─────┘                                                │   │
 │  │        │ (all tests pass, max 3 loops)                        │   │
@@ -91,14 +91,14 @@ GIRT does **not** build its own runtime or sandbox. It sits as an **MCP proxy** 
 │  │        │                                                      │   │
 │  │        ▼                                                      │   │
 │  │  ┌───────────┐   DECISION: Should this invocation proceed?    │   │
-│  │  │ Execution │──► Policy rules (Wassette YAML)                │   │
+│  │  │ Execution │──► Policy rules (policy.yaml)                │   │
 │  │  │ Gate      │──► Cached prior decisions                      │   │
 │  │  │           │──► LLM evaluation (novel context)              │   │
 │  │  │           │──► HITL (sensitive operations)                 │   │
 │  │  └─────┬─────┘                                                │   │
 │  │        │ (allowed)                                            │   │
 │  │        ▼                                                      │   │
-│  │  [Proxy to Wassette MCP Server]                               │   │
+│  │  [Execute via girt-runtime (LifecycleManager)]               │   │
 │  │        │                                                      │   │
 │  │        ▼                                                      │   │
 │  │  [Return result to Operator]                                  │   │
@@ -106,23 +106,22 @@ GIRT does **not** build its own runtime or sandbox. It sits as an **MCP proxy** 
 │                                                                     │
 │  ┌─ SECRET WRAPPER ─────────────────────────────────────────────┐   │
 │  │  host_auth_proxy(service_name) → Vault/env lookup             │   │
-│  │  Wraps Wassette's env-var permissions with zero-knowledge     │   │
+│  │  Wraps girt-runtime's env-var permissions with zero-knowledge     │   │
 │  │  proxy. Secrets never enter WASM memory.                      │   │
 │  └───────────────────────────────────────────────────────────────┘   │
 │                                                                     │
-└─────────────────────────────────────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                    WASSETTE MCP SERVER                               │
+│  ┌─ GIRT RUNTIME (embedded, derived from Wassette MIT) ────────┐   │
+│  │                                                               │   │
+│  │  ┌─────────────┐  ┌──────────────────┐  ┌───────────────┐   │   │
+│  │  │ Lifecycle   │  │ Policy Engine    │  │ Wasmtime      │   │   │
+│  │  │ Manager     │  │ (policy.yaml)    │  │ Sandbox       │   │   │
+│  │  └─────────────┘  └──────────────────┘  └───────────────┘   │   │
+│  │  ┌─────────────┐  ┌──────────────────┐                      │   │
+│  │  │ Component   │  │ WIT Introspection│                      │   │
+│  │  │ Storage     │  │ (WIT → MCP)      │                      │   │
+│  │  └─────────────┘  └──────────────────┘                      │   │
+│  └───────────────────────────────────────────────────────────────┘   │
 │                                                                     │
-│  ┌─────────────┐  ┌──────────────────┐  ┌───────────────────────┐  │
-│  │ Component   │  │ Policy Engine    │  │ Wasmtime Sandbox      │  │
-│  │ Registry    │  │ (YAML per-tool)  │  │ (WASI, deny-default)  │  │
-│  └─────────────┘  └──────────────────┘  └───────────────────────┘  │
-│  ┌─────────────┐  ┌──────────────────┐                             │
-│  │ OCI Loader  │  │ WIT Introspection│                             │
-│  └─────────────┘  └──────────────────┘                             │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -144,7 +143,7 @@ The same tri-state decision cascade from Hookwise is applied to two distinct gat
 | **HITL** | LLM rationale + spec | User makes final decision | ALLOW / DENY |
 
 **DEFER** is a fourth outcome unique to the Creation Gate. It does not reject the request — it redirects it to an existing capability, either:
-- A tool already in a registry (loaded into Wassette directly)
+- A tool already in a registry (loaded into girt-runtime directly)
 - A CLI utility the Operator should invoke natively
 - An existing tool that should be extended with the requested feature
 
@@ -154,7 +153,7 @@ The same tri-state decision cascade from Hookwise is applied to two distinct gat
 
 | Layer | Input | Logic | Outcome |
 |---|---|---|---|
-| **Wassette Policy** | Tool ID + params | Wassette's per-component YAML policy (network hosts, storage paths, env vars) | DENY (policy violation) / pass-through |
+| **Runtime Policy** | Tool ID + params | girt-runtime's per-component `policy.yaml` (network hosts, storage paths, env vars) | DENY (policy violation) / pass-through |
 | **Cached Decisions** | Tool ID + param signature | Lookup prior allow/deny for same tool with similar parameters | ALLOW / DENY / pass-through |
 | **LLM Evaluation** | Full invocation context | LLM evaluates whether this specific invocation is appropriate given the Operator's current task and role | ALLOW / DENY / ASK |
 | **HITL** | LLM rationale + invocation | User makes final decision | ALLOW / DENY |
@@ -280,7 +279,7 @@ Generates WASM Component source code from the Architect's refined spec.
 **System Prompt:**
 ```
 You are a Senior Backend Engineer. You write functions that compile to
-wasm32-wasi Components and execute inside a Wasmtime sandbox via Wassette.
+wasm32-wasi Components and execute inside a Wasmtime sandbox via girt-runtime.
 
 Target: WebAssembly Component Model with WIT interface definitions.
 
@@ -305,13 +304,13 @@ the specific remediation_directive.
 
 Verifies that the Engineer's compiled WASM Component behaves according to spec.
 
-**Execution environment:** Tests run against Wassette's sandbox via `call_tool`. The QA agent does not have its own sandbox — it uses the same runtime the tool will run in production.
+**Execution environment:** Tests run against girt-runtime's sandbox via `call_tool`. The QA agent does not have its own sandbox — it uses the same runtime the tool will run in production.
 
 **System Prompt:**
 ```
 You are a QA Automation Engineer. You are given:
 1. The Architect's refined tool specification (expected behavior)
-2. The Engineer's compiled WASM Component (loaded in Wassette)
+2. The Engineer's compiled WASM Component (loaded in girt-runtime)
 
 Your objective is to verify functional correctness:
 
@@ -319,7 +318,7 @@ Your objective is to verify functional correctness:
    - Standard use cases (happy path)
    - Edge cases (empty inputs, boundary values, unicode)
    - Malformed inputs (wrong types, missing fields, oversized payloads)
-2. Execute each payload against the component via Wassette's call_tool.
+2. Execute each payload against the component via girt-runtime's invoke API.
 3. Compare outputs against the specification's expected behavior.
 
 If ANY output does not match expected behavior, output a Bug Ticket:
@@ -338,16 +337,16 @@ produces incorrect results.
 
 ### 4.5 The Red Team Agent (Security Auditor)
 
-Actively attempts to exploit the component within Wassette's sandbox.
+Actively attempts to exploit the component within girt-runtime's sandbox.
 
-**Execution environment:** Same Wassette sandbox as production, with instrumentation to detect policy violations and anomalous behavior.
+**Execution environment:** Same girt-runtime sandbox as production, with instrumentation to detect policy violations and anomalous behavior.
 
 **System Prompt:**
 ```
 You are an Offensive Security Researcher. You are given:
 1. The source code of a newly generated WASM Component
 2. Its policy.yaml (declared permissions)
-3. Access to execute payloads against it in Wassette's sandbox
+3. Access to execute payloads against it in girt-runtime's sandbox
 
 Your Mission: Attempt to force the component to act outside its declared
 capabilities.
@@ -365,7 +364,7 @@ Attack vectors to attempt:
 - Data exfiltration: Attempt to leak input data through allowed
   network channels (e.g., DNS, URL params to allowed hosts)
 
-Execute your attack payloads via Wassette's call_tool.
+Execute your attack payloads via girt-runtime's invoke API.
 
 If ANY payload successfully bypasses declared policy, output a Bug Ticket:
 {
@@ -454,7 +453,7 @@ These tools bypass the build pipeline entirely. They are maintained as versioned
 
 ## 6. Secret Handling: Zero-Knowledge Wrapper
 
-GIRT wraps Wassette's environment-variable permissions with a zero-knowledge proxy layer:
+GIRT wraps girt-runtime's environment-variable permissions with a zero-knowledge proxy layer:
 
 ```
 WASM Component                    GIRT Host                     Secret Store
@@ -473,7 +472,7 @@ WASM Component                    GIRT Host                     Secret Store
      │  (no token in WASM memory)    │                              │
 ```
 
-The component never receives the raw credential. It receives only the authenticated response body. This is implemented as a Wasmtime host function that GIRT injects when instantiating components through Wassette.
+The component never receives the raw credential. It receives only the authenticated response body. This is implemented as a Wasmtime host function that GIRT injects when instantiating components through girt-runtime.
 
 **Secret stores supported** (facade pattern — swappable):
 - Environment variables (`.env.local`, default)
@@ -487,25 +486,25 @@ The component never receives the raw credential. It receives only the authentica
 ### 7.1 GIRT as MCP Proxy
 
 ```
-AI Agent ──MCP──► GIRT Proxy ──MCP──► Wassette Server
+AI Agent ──MCP──► GIRT Proxy (with embedded girt-runtime)
                      │
                      ├── Intercepts tool_call requests
                      ├── Runs Execution Gate decision cascade
-                     ├── Proxies allowed calls to Wassette
+                     ├── Executes allowed calls via girt-runtime (LifecycleManager)
                      ├── Intercepts request_capability calls
                      ├── Runs Creation Gate + build pipeline
-                     └── Hot-reloads new tools into Wassette
+                     └── Hot-loads new tools into girt-runtime
 ```
 
 ### 7.2 Transport
 
-GIRT exposes an MCP server via **stdio** (for local Claude Code integration) or **SSE** (for networked setups). It connects to Wassette as an MCP client.
+GIRT exposes an MCP server via **stdio** (for local Claude Code integration) or **SSE** (for networked setups). There is no separate WASM runtime process — `girt-runtime` runs in-process.
 
 ### 7.3 Hot Reload
 
 When a new tool passes the build pipeline:
-1. GIRT calls Wassette's `load-component` with the compiled `.wasm` artifact
-2. Wassette registers the component and generates JSON Schema from its WIT interface
+1. GIRT calls `LifecycleManager::load_component("file:///path/to/tool.wasm")` on the embedded runtime
+2. girt-runtime compiles the component, derives JSON Schema from its WIT interface, and adds it to the in-memory registry
 3. GIRT sends an MCP `tools/list_changed` notification to the Operator
 4. The Operator's tool registry updates without restarting
 
@@ -528,7 +527,7 @@ The build pipeline is orchestrated as a **Claude Code agent team** via a custom 
 ```
 girt-plugin/
 ├── plugin.json
-├── .mcp.json                  # Wassette + GIRT proxy servers
+├── .mcp.json                  # GIRT proxy server (runtime embedded)
 ├── agents/
 │   ├── pipeline-lead.md       # Queue consumer + orchestrator
 │   ├── architect.md           # Spec refinement
@@ -555,7 +554,7 @@ girt-plugin/
 | Epiphytic Project | Relationship to GIRT |
 |---|---|
 | **Hookwise** (fka captain-hook) | GIRT embeds the Hookwise decision engine for both Creation and Execution gates. Hookwise's policy rules, cache, similarity matching, LLM eval, and HITL cascade are the core decision infrastructure. |
-| **Wassette** (Microsoft, adopted) | GIRT's execution runtime. All WASM sandboxing, policy enforcement, and MCP tool serving is delegated to Wassette. GIRT manages the build pipeline and proxies execution. |
+| **girt-runtime** (ported from Wassette MIT) | GIRT's embedded WASM execution runtime, ported from Wassette. Provides Wasmtime sandboxing, policy enforcement, WIT introspection, and dynamic component lifecycle. Runs in-process; no external subprocess. |
 | **Claude Code Plugin** | The GIRT pipeline runs as a Claude Code plugin with an agent team. See [ADR-007](../adrs/ADR-007-claude-agent-team-orchestration.md). The plugin provides agents, skills, hooks, and commands for the full lifecycle. |
 | **agent-fork-join** | Patterns from agent-fork-join inform the Pipeline Lead's orchestration of QA + Red Team parallel execution and the bug-ticket loop. |
 | **duratii** | Future: GIRT could run as a cloud service on Cloudflare Workers via duratii, serving tool registries and build pipelines remotely. |
@@ -616,7 +615,7 @@ Every tool published to an OCI registry is a self-contained artifact bundle:
 <tool_name>:<version>
 ├── component.wasm          # Compiled WASM Component (wasm32-wasi)
 ├── component.wit           # WIT interface definition
-├── policy.yaml             # Wassette permission declaration
+├── policy.yaml             # girt-runtime permission declaration
 ├── spec.json               # Architect's refined capability spec
 └── manifest.json           # GIRT metadata
 ```
@@ -661,10 +660,10 @@ Each failure point in the pipeline has a defined recovery path:
 | **Architect — LLM call fails** | Retry once. If second failure, pass the Operator's raw spec directly to the Engineer unrefined. Log at WARN. | Unrefined spec may produce a less reusable tool, but the pipeline isn't blocked. |
 | **Engineer — compilation fails** | Counts as a build iteration. Bug ticket with compiler errors routes back to Engineer. | Circuit breaker after 3 iterations. |
 | **Engineer — LLM call fails** | Retry once. If second failure, halt pipeline and escalate to user. | User can retry or provide code manually. |
-| **QA — test execution fails (Wassette error)** | Distinguish from functional failure. Wassette errors are infrastructure, not code bugs. Retry once. | If Wassette is persistently down, halt pipeline with infra error message. |
+| **QA — test execution fails (girt-runtime error)** | Distinguish from functional failure. girt-runtime errors are infrastructure, not code bugs. Retry once. | If girt-runtime fails persistently, halt pipeline with infra error message. |
 | **Red Team — no exploits found** | This is the success path. Component passes security audit. | N/A |
 | **Publishing — OCI registry unreachable** | Cache locally. Queue for retry. Tool is still usable from local cache. | Background retry with exponential backoff. Notify user if retry exhausted. |
-| **Execution Gate — Wassette policy violation** | DENY. Return structured error to Operator with the specific policy rule violated. | Operator can request a new tool with broader permissions (goes through Creation Gate again). |
+| **Execution Gate — policy violation** | DENY. Return structured error to Operator with the specific policy rule violated. | Operator can request a new tool with broader permissions (goes through Creation Gate again). |
 | **Secret store — lookup fails** | Return structured error to component. Do NOT fall back to plaintext env vars. | User must fix secret store configuration. |
 
 ### Structured Error Format
@@ -722,7 +721,7 @@ When a metrics backend is configured:
 
 ## 14. Resource Limits
 
-WASM execution through Wassette must be bounded to prevent resource exhaustion:
+WASM execution through girt-runtime must be bounded to prevent resource exhaustion:
 
 | Resource | Default Limit | Configurable |
 |---|---|---|
@@ -732,7 +731,7 @@ WASM execution through Wassette must be bounded to prevent resource exhaustion:
 | **Network response size** | 10 MB per HTTP response | Yes, in policy.yaml |
 | **Concurrent instances** | 1 per component (no parallel invocations of same tool) | Yes, in girt.toml |
 
-These limits are enforced by Wassette's Wasmtime configuration. GIRT generates the appropriate settings in `policy.yaml` based on the Architect's spec and the defaults in `girt.toml`.
+These limits are enforced by girt-runtime's Wasmtime configuration. GIRT generates the appropriate settings in `policy.yaml` based on the Architect's spec and the defaults in `girt.toml`.
 
 ### Resource limit in policy.yaml
 
@@ -768,13 +767,13 @@ GIRT is tested at three levels:
 ### 15.2 Integration Tests
 
 - **Full build pipeline (mocked LLMs):** Feed a capability spec through the pipeline with deterministic LLM responses. Verify the correct sequence: Creation Gate → Architect → Engineer → QA → Red Team → Publish.
-- **Wassette integration:** Load a known-good .wasm component into Wassette via GIRT. Verify execution, policy enforcement, and hot-reload.
+- **girt-runtime integration:** Load a known-good .wasm component via `LifecycleManager::load_component`. Verify execution, policy enforcement, and hot-reload.
 - **Bug ticket loop:** Simulate QA failure, verify the ticket routes to Engineer, verify the circuit breaker fires after 3 iterations.
 - **Registry round-trip:** Build a tool, publish to a local OCI registry, verify it's discoverable by the Creation Gate's registry lookup.
 
 ### 15.3 End-to-End Tests
 
-- **Real LLM, real Wassette:** Submit a capability request ("build a tool that converts Celsius to Fahrenheit"). Verify the full pipeline produces a working, published WASM component that returns correct results.
+- **Real LLM, real girt-runtime:** Submit a capability request ("build a tool that converts Celsius to Fahrenheit"). Verify the full pipeline produces a working, published WASM component that returns correct results.
 - **Rejection path:** Submit a known-dangerous request (e.g., "read /etc/shadow"). Verify the Creation Gate denies it without reaching the Engineer.
 - **DEFER path:** Pre-load a "temperature converter" tool in the registry. Submit a similar request. Verify the Creation Gate defers to the existing tool.
 - **Circuit breaker E2E:** Submit a request that's intentionally difficult to implement correctly. Verify the pipeline halts after 3 iterations and escalates.
@@ -792,15 +791,15 @@ Per global conventions:
 
 ### Phase 0: Foundation (Weeks 1-2)
 
-**Goal:** Skeleton project with MCP proxy and Wassette integration.
+**Goal:** Skeleton project with MCP proxy and girt-runtime integration.
 
 - [ ] Initialize Rust project with Cargo workspace
-- [ ] Implement minimal MCP proxy (stdio transport, pass-through to Wassette)
-- [ ] Verify: agent connects through GIRT to Wassette, existing tools work
+- [ ] Implement minimal MCP proxy (stdio transport, girt-runtime in-process)
+- [ ] Verify: agent connects to GIRT, girt-runtime executes tools correctly
 - [ ] Set up CI (build, lint, unit tests)
 - [ ] Establish OCI registry structure on ghcr.io/epiphytic
 
-**Deliverable:** GIRT as a transparent MCP proxy. No decision engine, no build pipeline. Just a working pipe between agent and Wassette.
+**Deliverable:** GIRT as a transparent MCP proxy backed by girt-runtime. No decision engine, no build pipeline. Just a working pipe — agent calls tools, girt-runtime executes them.
 
 ### Phase 1: Decision Engine (Weeks 3-4)
 
@@ -824,8 +823,8 @@ Per global conventions:
 
 - [ ] Implement Architect agent (LLM call with spec refinement prompt)
 - [ ] Implement Engineer agent (LLM call → Rust code → `cargo component build`)
-- [ ] Implement QA agent (LLM generates test payloads → executes via Wassette)
-- [ ] Implement Red Team agent (LLM generates exploit payloads → executes via Wassette)
+- [ ] Implement QA agent (LLM generates test payloads → executes via girt-runtime)
+- [ ] Implement Red Team agent (LLM generates exploit payloads → executes via girt-runtime)
 - [ ] Implement bug ticket routing (QA/Red Team → Engineer)
 - [ ] Implement circuit breaker (max 3 iterations → HITL escalation)
 - [ ] Implement policy.yaml generation from Architect spec
@@ -848,7 +847,7 @@ Per global conventions:
 - [ ] Create skills (request-capability, list-tools, promote-tool)
 - [ ] Create hooks (capability-intercept, tool-call-gate)
 - [ ] Create commands (/girt-status, /girt-build, /girt-registry)
-- [ ] Wire MCP servers (.mcp.json for Wassette + GIRT proxy)
+- [ ] Wire MCP servers (.mcp.json for GIRT proxy (runtime embedded))
 - [ ] Integration test: full pipeline via Claude Code agent team
 - [ ] E2E test: user requests capability, team builds and delivers it
 
@@ -889,7 +888,7 @@ Per global conventions:
 
 All ADRs have been written and accepted:
 
-1. **[ADR-001: Wassette Fork Strategy](../adrs/ADR-001-wassette-fork-strategy.md)** — Fork if bloated, easier to rewrite, or upstream hostile to contributions. Facade pattern protects against lock-in.
+1. **[ADR-001: Wassette Fork Strategy](../adrs/ADR-001-wassette-fork-strategy.md)** *(Superseded by ADR-010)* — Original strategy for Wassette as an external dependency. Superseded by embedded runtime approach.
 2. **[ADR-002: WIT Interface Standardization](../adrs/ADR-002-wit-interface-standardization.md)** — Standard `girt-world` WIT definition, versioned. Tools must be source-available, buildable from source, with SLSA provenance attestations via GitHub Actions. Unattested tools blocked by default.
 3. **[ADR-003: Tool Versioning Semantics](../adrs/ADR-003-tool-versioning-semantics.md)** — Semver for all tools. Staleness policy: flagged at 6 months, deprecated at 9, removal candidate at 12. Automated rebuild pipeline keeps healthy tools fresh.
 4. **[ADR-004: Multi-Language Build Targets](../adrs/ADR-004-multi-language-build-targets.md)** — Engineer selects language from user config or automatically based on capability type. Rust default, Go and AssemblyScript supported.
@@ -898,3 +897,4 @@ All ADRs have been written and accepted:
 7. **[ADR-007: Claude Agent Team Orchestration](../adrs/ADR-007-claude-agent-team-orchestration.md)** — Pipeline runs as Claude Code agent team via plugin with file-based queue and native HITL.
 8. **[ADR-008: Queue Event Mechanism](../adrs/ADR-008-queue-event-mechanism.md)** — inotify/kqueue via `notify` crate. `EventSource` trait for future backends (NATS, webhooks).
 9. **[ADR-009: Pipeline Lead Persistence](../adrs/ADR-009-pipeline-lead-persistence.md)** — Long-running agent. Records learnings to MANIFEST.md and docs/ in girt-tools after each request, then clears context.
+10. **[ADR-010: Embedded WASM Runtime](../adrs/ADR-010-embedded-wasm-runtime.md)** — GIRT embeds `girt-runtime` (ported from Wassette MIT) instead of using Wassette as a subprocess. `LifecycleManager` provides the dynamic component loading API.

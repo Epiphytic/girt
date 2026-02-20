@@ -1,0 +1,8 @@
+# Claude Code plugin cache
+.fork-join/
+
+# Local config (secrets, debug flags)
+.env.local
+
+# GIRT local state
+.girt/

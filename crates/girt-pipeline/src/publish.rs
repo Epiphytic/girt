@@ -54,6 +54,88 @@ impl Publisher {
         })
     }
 
+    pub async fn publish_with_wasm(
+        &self,
+        artifact: &BuildArtifact,
+        wasm_path: &std::path::Path,
+    ) -> Result<PublishResult, PipelineError> {
+        let tool_name = artifact.spec.name.clone();
+
+        let local_path = self.cache.store(artifact).await?;
+
+        let cached_wasm = local_path.join("tool.wasm");
+        tokio::fs::copy(wasm_path, &cached_wasm).await?;
+
+        tracing::info!(
+            tool = %tool_name,
+            path = %local_path.display(),
+            "Artifact published to local cache with WASM binary"
+        );
+
+        Ok(PublishResult {
+            tool_name,
+            local_path,
+            oci_reference: None,
+        })
+    }
+
+    pub async fn push_oci(
+        &self,
+        artifact: &BuildArtifact,
+        wasm_path: &std::path::Path,
+        registry_url: &str,
+        tag: &str,
+    ) -> Result<String, PipelineError> {
+        let tool_name = &artifact.spec.name;
+        let reference = format!("{}/{}:{}", registry_url, tool_name, tag);
+
+        let cache_dir = self.cache.base_dir().join(tool_name);
+        let manifest_path = cache_dir.join("manifest.json");
+        let policy_path = cache_dir.join("policy.yaml");
+
+        for path in [wasm_path, manifest_path.as_path(), policy_path.as_path()] {
+            if !path.exists() {
+                return Err(PipelineError::PublishError(format!(
+                    "Required file missing: {}",
+                    path.display()
+                )));
+            }
+        }
+
+        let output = tokio::process::Command::new("oras")
+            .arg("push")
+            .arg(&reference)
+            .arg(format!(
+                "{}:application/vnd.wasm.component.layer.v0+wasm",
+                wasm_path.display()
+            ))
+            .arg(format!(
+                "{}:application/vnd.girt.policy.v1+yaml",
+                policy_path.display()
+            ))
+            .arg(format!(
+                "{}:application/vnd.girt.manifest.v1+json",
+                manifest_path.display()
+            ))
+            .output()
+            .await
+            .map_err(|e| {
+                PipelineError::PublishError(format!(
+                    "Failed to run oras: {e}. Is it installed?"
+                ))
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(PipelineError::PublishError(format!(
+                "oras push failed: {stderr}"
+            )));
+        }
+
+        tracing::info!(tool = %tool_name, reference = %reference, "Pushed to OCI registry");
+        Ok(reference)
+    }
+
     /// Get the underlying cache for lookups.
     pub fn cache(&self) -> &ToolCache {
         &self.cache
@@ -106,6 +188,29 @@ mod tests {
             },
             build_iterations: 1,
         }
+    }
+
+    #[tokio::test]
+    async fn publish_full_stores_wasm_in_cache() {
+        let tmp = TempDir::new().unwrap();
+        let cache = ToolCache::new(tmp.path().join("tools"));
+        let publisher = Publisher::new(cache);
+        publisher.init().await.unwrap();
+
+        let artifact = make_artifact();
+
+        let wasm_dir = tmp.path().join("build");
+        std::fs::create_dir_all(&wasm_dir).unwrap();
+        let wasm_path = wasm_dir.join("published_tool.wasm");
+        std::fs::write(&wasm_path, b"fake wasm bytes").unwrap();
+
+        let result = publisher
+            .publish_with_wasm(&artifact, &wasm_path)
+            .await
+            .unwrap();
+
+        assert_eq!(result.tool_name, "published_tool");
+        assert!(result.local_path.join("tool.wasm").exists());
     }
 
     #[tokio::test]

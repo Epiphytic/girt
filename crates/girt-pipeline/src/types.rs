@@ -71,6 +71,26 @@ pub enum SpecAction {
     RecommendExtend,
 }
 
+/// Supported build target languages.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetLanguage {
+    #[default]
+    Rust,
+    Go,
+    AssemblyScript,
+}
+
+impl std::fmt::Display for TargetLanguage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rust => write!(f, "rust"),
+            Self::Go => write!(f, "go"),
+            Self::AssemblyScript => write!(f, "assemblyscript"),
+        }
+    }
+}
+
 /// The Engineer's build output.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuildOutput {
@@ -161,8 +181,83 @@ pub struct PolicyResources {
     pub max_response_bytes: u64,
 }
 
+/// Predefined resource limit tiers for policy generation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceTier {
+    /// Minimal resources for simple stateless transforms (64 MB, 5s timeout).
+    Minimal,
+    /// Standard resources for typical tools (128 MB, 15s timeout).
+    #[default]
+    Standard,
+    /// Extended resources for data-heavy or network-bound tools (512 MB, 60s timeout).
+    Extended,
+}
+
+impl ResourceTier {
+    /// Convert tier to concrete resource limits.
+    pub fn to_resources(&self) -> PolicyResources {
+        match self {
+            Self::Minimal => PolicyResources {
+                memory_mb: 64,
+                fuel: 100_000_000,
+                timeout_seconds: 5,
+                max_response_bytes: 1_048_576, // 1 MB
+            },
+            Self::Standard => PolicyResources {
+                memory_mb: 128,
+                fuel: 500_000_000,
+                timeout_seconds: 15,
+                max_response_bytes: 5_242_880, // 5 MB
+            },
+            Self::Extended => PolicyResources {
+                memory_mb: 512,
+                fuel: 2_000_000_000,
+                timeout_seconds: 60,
+                max_response_bytes: 20_971_520, // 20 MB
+            },
+        }
+    }
+}
+
+/// Maximum allowed resource limits (hard ceiling).
+const MAX_MEMORY_MB: u32 = 1024;
+const MAX_TIMEOUT_SECONDS: u32 = 120;
+const MAX_RESPONSE_BYTES: u64 = 52_428_800; // 50 MB
+
+impl PolicyResources {
+    /// Validate that resource limits are within acceptable bounds.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.memory_mb > MAX_MEMORY_MB {
+            return Err(format!(
+                "memory_mb {} exceeds maximum {}",
+                self.memory_mb, MAX_MEMORY_MB
+            ));
+        }
+        if self.timeout_seconds > MAX_TIMEOUT_SECONDS {
+            return Err(format!(
+                "timeout_seconds {} exceeds maximum {}",
+                self.timeout_seconds, MAX_TIMEOUT_SECONDS
+            ));
+        }
+        if self.max_response_bytes > MAX_RESPONSE_BYTES {
+            return Err(format!(
+                "max_response_bytes {} exceeds maximum {}",
+                self.max_response_bytes, MAX_RESPONSE_BYTES
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl PolicyYaml {
+    /// Create a policy from a spec using the default (Standard) resource tier.
     pub fn from_spec(spec: &CapabilitySpec) -> Self {
+        Self::from_spec_with_tier(spec, &ResourceTier::default())
+    }
+
+    /// Create a policy from a spec with a specific resource tier.
+    pub fn from_spec_with_tier(spec: &CapabilitySpec, tier: &ResourceTier) -> Self {
         Self {
             version: "1.0".into(),
             permissions: PolicyPermissions {
@@ -177,12 +272,21 @@ impl PolicyYaml {
                 storage: serde_json::json!({}),
                 environment: serde_json::json!({}),
             },
-            resources: PolicyResources {
-                memory_mb: 128,
-                fuel: 500_000_000,
-                timeout_seconds: 15,
-                max_response_bytes: 5_242_880,
-            },
+            resources: tier.to_resources(),
+        }
+    }
+
+    /// Infer the appropriate resource tier from a spec's constraints.
+    pub fn infer_tier(spec: &CapabilitySpec) -> ResourceTier {
+        let has_network = !spec.constraints.network.is_empty();
+        let has_storage = !spec.constraints.storage.is_empty();
+
+        if has_network && has_storage {
+            ResourceTier::Extended
+        } else if has_network || has_storage {
+            ResourceTier::Standard
+        } else {
+            ResourceTier::Minimal
         }
     }
 }

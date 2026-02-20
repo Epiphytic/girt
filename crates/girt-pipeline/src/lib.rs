@@ -2,6 +2,7 @@ pub mod agent;
 pub mod cache;
 pub mod error;
 pub mod llm;
+pub mod metrics;
 pub mod orchestrator;
 pub mod publish;
 pub mod queue;

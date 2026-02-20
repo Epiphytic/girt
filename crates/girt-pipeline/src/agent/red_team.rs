@@ -70,13 +70,10 @@ impl<'a> RedTeamAgent<'a> {
             None => {
                 tracing::warn!(
                     raw_response = %response.content,
-                    "Red Team response did not contain valid JSON, defaulting to pass"
+                    "Red Team response did not contain valid JSON, defaulting to fail"
                 );
-                // Default to passing when the LLM fails to produce valid JSON.
-                // The Red Team agent performs simulated auditing; a parse failure
-                // means the LLM didn't follow instructions, not a security issue.
                 SecurityResult {
-                    passed: true,
+                    passed: false,
                     exploits_attempted: 0,
                     exploits_succeeded: 0,
                     bug_tickets: vec![],

@@ -27,21 +27,20 @@ pub(crate) fn extract_json<T: serde::de::DeserializeOwned>(raw: &str) -> Option<
 
     // 3. Try extracting from code fences (search from end to avoid
     //    picking up backticks inside think blocks or prose)
-    if let Some(json_str) = extract_from_code_fence(trimmed) {
-        if let Ok(val) = serde_json::from_str::<T>(json_str) {
-            return Some(val);
-        }
+    if let Some(json_str) = extract_from_code_fence(trimmed)
+        && let Ok(val) = serde_json::from_str::<T>(json_str)
+    {
+        return Some(val);
     }
 
     // 4. Try finding the outermost { ... }
-    if let Some(start) = trimmed.find('{') {
-        if let Some(end) = trimmed.rfind('}') {
-            if end > start {
-                let json_str = &trimmed[start..=end];
-                if let Ok(val) = serde_json::from_str::<T>(json_str) {
-                    return Some(val);
-                }
-            }
+    if let Some(start) = trimmed.find('{')
+        && let Some(end) = trimmed.rfind('}')
+        && end > start
+    {
+        let json_str = &trimmed[start..=end];
+        if let Ok(val) = serde_json::from_str::<T>(json_str) {
+            return Some(val);
         }
     }
 

@@ -69,13 +69,10 @@ impl<'a> QaAgent<'a> {
             None => {
                 tracing::warn!(
                     raw_response = %response.content,
-                    "QA response did not contain valid JSON, defaulting to pass"
+                    "QA response did not contain valid JSON, defaulting to fail"
                 );
-                // Default to passing when the LLM fails to produce valid JSON.
-                // The QA agent performs simulated testing; a parse failure means
-                // the LLM didn't follow instructions, not that the code is bad.
                 QaResult {
-                    passed: true,
+                    passed: false,
                     tests_run: 0,
                     tests_passed: 0,
                     tests_failed: 0,

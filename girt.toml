@@ -1,12 +1,18 @@
 [llm]
 # provider options:
-#   "anthropic"        — Anthropic Claude (recommended; set ANTHROPIC_API_KEY env var)
+#   "anthropic"         — Anthropic Claude (recommended)
 #   "openai-compatible" — Any OpenAI-compatible endpoint (e.g. vLLM, Ollama)
-#   "stub"             — Deterministic no-op for testing
+#   "stub"              — Deterministic no-op for testing
 provider = "anthropic"
 model = "claude-sonnet-4-5"
-# api_key = "sk-ant-..."  # or set ANTHROPIC_API_KEY env var
 max_tokens = 4096
+
+# Credential resolution order (anthropic provider):
+#   1. ANTHROPIC_API_KEY environment variable
+#   2. OpenClaw auth-profiles (~/.openclaw/agents/main/agent/auth-profiles.json)
+#      — if you've run `openclaw models auth setup-token --provider anthropic`, no config needed
+#   3. api_key below (last resort)
+# api_key = "sk-ant-..."
 
 # Uncomment to use local vLLM / GLM instead:
 # provider = "openai-compatible"

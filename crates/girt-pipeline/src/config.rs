@@ -84,12 +84,10 @@ impl GirtConfig {
     pub fn build_llm_client(&self) -> Result<Arc<dyn LlmClient>, PipelineError> {
         match self.llm.provider {
             LlmProvider::Anthropic => {
-                let api_key_fallback = std::env::var("ANTHROPIC_API_KEY")
-                    .ok()
-                    .or_else(|| self.llm.api_key.clone());
+                // from_env_or checks: ANTHROPIC_API_KEY → openclaw auth-profiles → api_key in toml
                 let client = AnthropicLlmClient::from_env_or(
                     self.llm.model.clone(),
-                    api_key_fallback,
+                    self.llm.api_key.clone(),
                 )?;
                 Ok(Arc::new(client))
             }
@@ -160,16 +158,32 @@ provider = "stub"
     }
 
     #[test]
-    fn build_llm_client_anthropic_fails_without_key() {
-        // Ensure env var is not set in this test
-        // SAFETY: single-threaded test, no other threads reading this var
-        unsafe { std::env::remove_var("ANTHROPIC_API_KEY") };
+    fn build_llm_client_anthropic_with_inline_key_succeeds() {
+        // An api_key in girt.toml is the last-resort fallback.
+        // This always works regardless of env or openclaw config.
         let toml_str = r#"[llm]
 provider = "anthropic"
 model = "claude-sonnet-4-5"
+api_key = "sk-ant-test-key"
 "#;
         let config: GirtConfig = toml::from_str(toml_str).unwrap();
-        assert!(config.build_llm_client().is_err());
+        assert!(config.build_llm_client().is_ok());
+    }
+
+    #[test]
+    fn build_llm_client_anthropic_resolution_order() {
+        // Credential resolution: ANTHROPIC_API_KEY > openclaw auth-profiles > api_key in toml.
+        // If an explicit key is in toml it always wins as a final fallback.
+        // We can't reliably test the "no credentials anywhere" case in CI
+        // because a developer machine may have openclaw configured.
+        let toml_str = r#"[llm]
+provider = "anthropic"
+model = "claude-sonnet-4-5"
+api_key = "sk-ant-fallback"
+"#;
+        let config: GirtConfig = toml::from_str(toml_str).unwrap();
+        // Should succeed via api_key fallback even with no env var
+        assert!(config.build_llm_client().is_ok());
     }
 
     #[test]

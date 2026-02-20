@@ -117,6 +117,58 @@ impl LlmClient for OpenAiCompatibleClient {
     }
 }
 
+/// Read the Anthropic token from OpenClaw's auth-profiles.json.
+///
+/// Checks `$OPENCLAW_STATE_DIR` first, then `~/.openclaw`.
+/// Returns `None` silently if the file doesn't exist or can't be parsed —
+/// the caller will try the next fallback.
+fn openclaw_anthropic_token() -> Option<String> {
+    let state_dir = std::env::var("OPENCLAW_STATE_DIR")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".openclaw")))?;
+
+    let profiles_path = state_dir
+        .join("agents")
+        .join("main")
+        .join("agent")
+        .join("auth-profiles.json");
+
+    let content = std::fs::read_to_string(&profiles_path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+
+    // Walk: profiles -> "anthropic:default" -> token
+    // Also accept the first profile whose provider is "anthropic".
+    let profiles = json.get("profiles")?.as_object()?;
+
+    // Prefer the lastGood profile if specified
+    let preferred_key = json
+        .get("lastGood")
+        .and_then(|lg| lg.get("anthropic"))
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| "anthropic:default".into());
+
+    let token = profiles
+        .get(&preferred_key)
+        .or_else(|| {
+            // Fall back to any anthropic profile
+            profiles
+                .values()
+                .find(|v| v.get("provider").and_then(|p| p.as_str()) == Some("anthropic"))
+        })
+        .and_then(|p| p.get("token"))
+        .and_then(|t| t.as_str())
+        .map(String::from)?;
+
+    tracing::debug!(
+        path = %profiles_path.display(),
+        "Loaded Anthropic token from OpenClaw auth-profiles"
+    );
+
+    Some(token)
+}
+
 /// Anthropic Messages API client.
 ///
 /// Calls `POST /v1/messages` with the Claude model specified in config.
@@ -137,14 +189,24 @@ impl AnthropicLlmClient {
         }
     }
 
-    /// Construct from environment, falling back to the provided key.
+    /// Resolve the Anthropic token using the following priority:
+    ///
+    /// 1. `ANTHROPIC_API_KEY` environment variable
+    /// 2. OpenClaw auth-profiles.json (`~/.openclaw/agents/main/agent/auth-profiles.json`)
+    /// 3. `api_key` field in `girt.toml`
+    ///
+    /// This allows GIRT to reuse the same credentials OpenClaw is already
+    /// configured with (setup-token or API key), with no separate configuration.
     pub fn from_env_or(model: String, api_key_fallback: Option<String>) -> Result<Self, PipelineError> {
         let api_key = std::env::var("ANTHROPIC_API_KEY")
             .ok()
+            .or_else(openclaw_anthropic_token)
             .or(api_key_fallback)
             .ok_or_else(|| {
                 PipelineError::LlmError(
-                    "Anthropic API key not found. Set ANTHROPIC_API_KEY or provide api_key in girt.toml".into(),
+                    "Anthropic credentials not found. \
+                     Options: set ANTHROPIC_API_KEY, run `openclaw models auth setup-token --provider anthropic`, \
+                     or set api_key in girt.toml".into(),
                 )
             })?;
         Ok(Self::new(model, api_key))

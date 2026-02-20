@@ -887,14 +887,14 @@ Per global conventions:
 
 ## 17. Open Design Decisions (Future ADRs)
 
-These items need dedicated Architecture Decision Records before implementation:
+All ADRs have been written and accepted:
 
-1. **ADR-001: Wassette fork strategy.** Under what conditions do we fork Wassette vs. contribute upstream vs. wrap externally? Define the threshold.
-2. **ADR-002: WIT interface standardization.** Should GIRT-generated tools follow a standard WIT world definition, or is each tool's interface bespoke?
-3. **ADR-003: Tool versioning semantics.** When the Engineer patches a bug, is it v1.1 of the same tool or a new tool? How do consumers pin versions?
-4. **ADR-004: Multi-language build targets.** How does the Engineer select the appropriate language? User config? Spec hint? Automatic based on capability type?
-5. **ADR-005: Remote GIRT service.** Should the build pipeline run locally, or as a cloud service that returns pre-built tools? Cost and latency tradeoffs.
-6. **ADR-006: Tool promotion pipeline.** What criteria and process moves a tool from Epiphytic Private to Public? Automated? Manual review? Both?
-7. **ADR-007: Claude Agent Team Orchestration.** *(Written)* Pipeline runs as a Claude Code agent team via plugin. See [docs/adrs/ADR-007](../adrs/ADR-007-claude-agent-team-orchestration.md).
-8. **ADR-008: Queue polling vs. filesystem watching.** Should the Pipeline Lead poll on a timer or use inotify/kqueue? Tradeoffs between latency, API cost, and portability.
-9. **ADR-009: Pipeline Lead persistence model.** Long-running agent (preserves context, risks bloat) vs. fresh-per-request (clean context, loses inter-request learning). Hybrid options.
+1. **[ADR-001: Wassette Fork Strategy](../adrs/ADR-001-wassette-fork-strategy.md)** — Fork if bloated, easier to rewrite, or upstream hostile to contributions. Facade pattern protects against lock-in.
+2. **[ADR-002: WIT Interface Standardization](../adrs/ADR-002-wit-interface-standardization.md)** — Standard `girt-world` WIT definition, versioned. Tools must be source-available, buildable from source, with SLSA provenance attestations via GitHub Actions. Unattested tools blocked by default.
+3. **[ADR-003: Tool Versioning Semantics](../adrs/ADR-003-tool-versioning-semantics.md)** — Semver for all tools. Staleness policy: flagged at 6 months, deprecated at 9, removal candidate at 12. Automated rebuild pipeline keeps healthy tools fresh.
+4. **[ADR-004: Multi-Language Build Targets](../adrs/ADR-004-multi-language-build-targets.md)** — Engineer selects language from user config or automatically based on capability type. Rust default, Go and AssemblyScript supported.
+5. **[ADR-005: Remote GIRT Service](../adrs/ADR-005-remote-girt-service.md)** — POC runs locally as Claude Code agent team. V2 adds configurable cloud build service behind a `BuildBackend` trait.
+6. **[ADR-006: Tool Promotion Pipeline](../adrs/ADR-006-tool-promotion-pipeline.md)** — All tools public initially via GitHub Actions in `epiphytic/girt-tools` monorepo. Private tier deferred until needed.
+7. **[ADR-007: Claude Agent Team Orchestration](../adrs/ADR-007-claude-agent-team-orchestration.md)** — Pipeline runs as Claude Code agent team via plugin with file-based queue and native HITL.
+8. **[ADR-008: Queue Event Mechanism](../adrs/ADR-008-queue-event-mechanism.md)** — inotify/kqueue via `notify` crate. `EventSource` trait for future backends (NATS, webhooks).
+9. **[ADR-009: Pipeline Lead Persistence](../adrs/ADR-009-pipeline-lead-persistence.md)** — Long-running agent. Records learnings to MANIFEST.md and docs/ in girt-tools after each request, then clears context.

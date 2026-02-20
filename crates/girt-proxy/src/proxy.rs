@@ -7,6 +7,7 @@ use girt_pipeline::llm::LlmClient;
 use girt_pipeline::orchestrator::{Orchestrator, PipelineOutcome};
 use girt_pipeline::publish::Publisher;
 use girt_pipeline::types::{CapabilityRequest, RequestSource};
+use girt_runtime::{ComponentMeta, LifecycleManager};
 use rmcp::{
     ErrorData as McpError, Peer, RoleServer, ServerHandler,
     model::{
@@ -20,15 +21,14 @@ use rmcp::{
 };
 use tokio::sync::Mutex;
 
-/// MCP proxy that routes agent requests through the Hookwise decision engine.
-///
-/// Tool execution is currently pending girt-runtime integration (ADR-010).
-/// The build pipeline (request_capability) is fully functional.
+/// MCP proxy that routes agent requests through the Hookwise decision engine
+/// and executes approved tool calls via the embedded girt-runtime (ADR-010).
 pub struct GirtProxy {
     engine: Arc<DecisionEngine>,
     llm: Arc<dyn LlmClient>,
     publisher: Arc<Publisher>,
-    /// Server peer for sending notifications (set during handler calls).
+    runtime: Arc<LifecycleManager>,
+    /// Server peer for sending tools/list_changed notifications.
     server_peer: Arc<Mutex<Option<Peer<RoleServer>>>>,
 }
 
@@ -37,11 +37,13 @@ impl GirtProxy {
         engine: Arc<DecisionEngine>,
         llm: Arc<dyn LlmClient>,
         publisher: Arc<Publisher>,
+        runtime: Arc<LifecycleManager>,
     ) -> Self {
         Self {
             engine,
             llm,
             publisher,
+            runtime,
             server_peer: Arc::new(Mutex::new(None)),
         }
     }
@@ -140,6 +142,26 @@ fn decision_to_content(decision: &Decision) -> Vec<Content> {
     vec![Content::text(json.to_string())]
 }
 
+/// Convert girt-runtime component metadata to an MCP Tool definition.
+fn component_meta_to_tool(meta: &ComponentMeta) -> Tool {
+    Tool {
+        name: meta.tool_name.clone().into(),
+        title: None,
+        description: Some(meta.description.clone().into()),
+        input_schema: meta
+            .input_schema
+            .as_object()
+            .cloned()
+            .unwrap_or_default()
+            .into(),
+        output_schema: None,
+        annotations: None,
+        execution: None,
+        icons: None,
+        meta: None,
+    }
+}
+
 fn make_tool_result(content: Vec<Content>, is_error: bool) -> CallToolResult {
     CallToolResult {
         content,
@@ -170,31 +192,9 @@ impl ServerHandler for GirtProxy {
 
         let mut tools = vec![request_capability_tool()];
 
-        // Add tools built by the pipeline and cached locally
-        // (girt-runtime will replace this with live LifecycleManager.list_tools() — ADR-010)
-        if let Ok(cached_names) = self.publisher.cache().list().await {
-            for name in cached_names {
-                if let Ok(Some(artifact)) = self.publisher.cache().get(&name).await {
-                    let tool = Tool {
-                        name: artifact.spec.name.into(),
-                        title: None,
-                        description: Some(artifact.spec.description.into()),
-                        input_schema: artifact
-                            .spec
-                            .inputs
-                            .as_object()
-                            .cloned()
-                            .unwrap_or_default()
-                            .into(),
-                        output_schema: None,
-                        annotations: None,
-                        execution: None,
-                        icons: None,
-                        meta: None,
-                    };
-                    tools.push(tool);
-                }
-            }
+        // Live tools from girt-runtime (built by pipeline, persisted across restarts)
+        for meta in self.runtime.list_tools().await {
+            tools.push(component_meta_to_tool(&meta));
         }
 
         Ok(ListToolsResult { tools, next_cursor: None, meta: None })
@@ -239,16 +239,34 @@ impl ServerHandler for GirtProxy {
 
         match &gate_result.decision {
             Decision::Allow => {
-                // TODO(ADR-010): execute via girt-runtime LifecycleManager
-                tracing::info!(tool = %tool_name, "Execution gate passed; girt-runtime pending");
-                Ok(make_tool_result(
-                    vec![Content::text(format!(
-                        "Tool '{}' approved but execution runtime (girt-runtime) not yet integrated. \
-                         This will be resolved in the next implementation phase (ADR-010).",
-                        tool_name
-                    ))],
-                    false,
-                ))
+                tracing::info!(tool = %tool_name, "Execution Gate passed — invoking via girt-runtime");
+
+                let args = request
+                    .arguments
+                    .as_ref()
+                    .map(|a| serde_json::to_value(a).unwrap_or(serde_json::Value::Null))
+                    .unwrap_or(serde_json::Value::Null);
+
+                match self.runtime.call_tool(tool_name, &args).await {
+                    Ok(result) => Ok(make_tool_result(
+                        vec![Content::text(result.to_string())],
+                        false,
+                    )),
+                    Err(girt_runtime::RuntimeError::ToolError(msg)) => {
+                        tracing::warn!(tool = %tool_name, error = %msg, "Tool returned error");
+                        Ok(make_tool_result(vec![Content::text(msg)], true))
+                    }
+                    Err(girt_runtime::RuntimeError::ToolNotFound(_)) => {
+                        Err(McpError::invalid_request(
+                            format!("Tool '{tool_name}' not found in girt-runtime"),
+                            None,
+                        ))
+                    }
+                    Err(e) => {
+                        tracing::error!(tool = %tool_name, error = %e, "girt-runtime invocation failed");
+                        Err(McpError::internal_error(format!("Runtime error: {e}"), None))
+                    }
+                }
             }
             Decision::Deny { .. } => {
                 tracing::warn!(tool = %tool_name, "Tool call denied");
@@ -396,40 +414,81 @@ impl GirtProxy {
                 tracing::info!(
                     tool = %tool_name,
                     iterations = artifact.build_iterations,
-                    "Build pipeline succeeded"
+                    "Build pipeline succeeded — compiling WASM"
                 );
 
-                // Publish to local cache
-                match self.publisher.publish(&artifact).await {
-                    Ok(result) => {
+                // Compile source → .wasm
+                let compile_input = girt_pipeline::compiler::CompileInput {
+                    source_code: artifact.build_output.source_code.clone(),
+                    wit_definition: String::new(), // uses default girt-tool world
+                    tool_name: artifact.spec.name.clone(),
+                    tool_version: "0.1.0".into(),
+                };
+                let compiler = girt_pipeline::compiler::WasmCompiler::new();
+
+                match compiler.compile(&compile_input).await {
+                    Ok(compiled) => {
                         tracing::info!(
-                            tool = %result.tool_name,
-                            path = %result.local_path.display(),
-                            "Tool published"
+                            tool = %tool_name,
+                            wasm = %compiled.wasm_path.display(),
+                            "Compilation succeeded"
                         );
 
-                        // Send tools/list_changed notification
-                        self.notify_tools_changed().await;
+                        // Publish with wasm
+                        let publish_result = match self
+                            .publisher
+                            .publish_with_wasm(&artifact, &compiled.wasm_path)
+                            .await
+                        {
+                            Ok(r) => r,
+                            Err(e) => {
+                                tracing::error!(error = %e, "Failed to publish artifact");
+                                return Ok(make_tool_result(
+                                    vec![Content::text(format!(
+                                        r#"{{"status":"publish_failed","error":"{e}"}}"#
+                                    ))],
+                                    true,
+                                ));
+                            }
+                        };
+
+                        // Load into girt-runtime
+                        let wasm_path = publish_result.local_path.join("tool.wasm");
+                        let meta = girt_runtime::ComponentMeta {
+                            component_id: format!("{}@0.1.0", artifact.spec.name),
+                            tool_name: artifact.spec.name.clone(),
+                            description: artifact.spec.description.clone(),
+                            input_schema: artifact.spec.inputs.clone(),
+                            wasm_hash: String::new(), // computed by storage
+                            built_at: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as u64)
+                                .unwrap_or(0),
+                        };
+
+                        if let Err(e) = self.runtime.load_component(&wasm_path, meta).await {
+                            tracing::error!(error = %e, tool = %tool_name, "Failed to load component into runtime");
+                        } else {
+                            // Notify agent that tool list changed
+                            self.notify_tools_changed().await;
+                        }
 
                         let response = serde_json::json!({
                             "status": "built",
-                            "tool_name": result.tool_name,
+                            "tool_name": publish_result.tool_name,
                             "build_iterations": artifact.build_iterations,
                             "tests_run": artifact.qa_result.tests_run,
                             "tests_passed": artifact.qa_result.tests_passed,
                             "exploits_attempted": artifact.security_result.exploits_attempted,
                             "exploits_succeeded": artifact.security_result.exploits_succeeded,
                         });
-                        Ok(make_tool_result(
-                            vec![Content::text(response.to_string())],
-                            false,
-                        ))
+                        Ok(make_tool_result(vec![Content::text(response.to_string())], false))
                     }
                     Err(e) => {
-                        tracing::error!(error = %e, "Failed to publish artifact");
+                        tracing::error!(tool = %tool_name, error = %e, "WASM compilation failed");
                         Ok(make_tool_result(
                             vec![Content::text(format!(
-                                "{{\"status\": \"publish_failed\", \"error\": \"{e}\"}}"
+                                r#"{{"status":"compile_failed","tool_name":"{tool_name}","error":"{e}"}}"#
                             ))],
                             true,
                         ))

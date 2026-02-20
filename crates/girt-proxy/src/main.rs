@@ -7,6 +7,7 @@ use girt_core::engine::DecisionEngine;
 use girt_pipeline::cache::ToolCache;
 use girt_pipeline::config::GirtConfig;
 use girt_pipeline::publish::Publisher;
+use girt_runtime::LifecycleManager;
 use rmcp::ServiceExt;
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -62,8 +63,16 @@ async fn main() -> Result<()> {
     let publisher = Arc::new(Publisher::new(cache));
     tracing::info!("Tool cache initialized");
 
+    // Initialize girt-runtime (ADR-010)
+    let runtime = Arc::new(
+        LifecycleManager::new(None).context("Failed to initialize girt-runtime")?,
+    );
+    // Restore components built in previous sessions
+    runtime.load_persisted().await;
+    tracing::info!("girt-runtime initialized");
+
     // Create proxy handler
-    let proxy = GirtProxy::new(engine, llm, publisher);
+    let proxy = GirtProxy::new(engine, llm, publisher, runtime);
 
     // Serve on stdio (agent connects here)
     let stdio = rmcp::transport::io::stdio();

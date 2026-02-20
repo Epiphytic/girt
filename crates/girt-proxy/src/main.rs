@@ -12,7 +12,10 @@ mod proxy;
 use proxy::GirtProxy;
 
 #[derive(Parser)]
-#[command(name = "girt", about = "GIRT MCP Proxy — routes agent requests to Wassette")]
+#[command(
+    name = "girt",
+    about = "GIRT MCP Proxy — routes agent requests to Wassette"
+)]
 struct Cli {
     /// Path to the Wassette binary
     #[arg(long, default_value = "wassette")]
@@ -40,11 +43,10 @@ async fn main() -> Result<()> {
     );
 
     // Spawn Wassette as a child process and connect as MCP client
-    let wassette_transport = TokioChildProcess::new(
-        Command::new(&cli.wassette_bin).configure(|cmd| {
+    let wassette_transport =
+        TokioChildProcess::new(Command::new(&cli.wassette_bin).configure(|cmd| {
             cmd.args(&cli.wassette_args);
-        }),
-    )?;
+        }))?;
 
     let wassette_service = ().serve(wassette_transport).await?;
 

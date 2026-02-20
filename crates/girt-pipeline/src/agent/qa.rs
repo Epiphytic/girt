@@ -64,13 +64,15 @@ impl<'a> QaAgent<'a> {
 
         let response = self.llm.chat(&request).await?;
 
-        let result: QaResult = serde_json::from_str(&response.content).map_err(|e| {
+        let result: QaResult = super::extract_json(&response.content).ok_or_else(|| {
             tracing::warn!(
                 raw_response = %response.content,
-                error = %e,
-                "QA response was not valid JSON"
+                "QA response did not contain valid JSON"
             );
-            PipelineError::QaError(format!("Failed to parse QA response: {e}"))
+            PipelineError::QaError(format!(
+                "Failed to parse QA response as JSON. Raw response: {}",
+                &response.content[..response.content.len().min(200)]
+            ))
         })?;
 
         tracing::info!(

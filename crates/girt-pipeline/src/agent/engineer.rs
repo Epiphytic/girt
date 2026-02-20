@@ -204,12 +204,12 @@ impl<'a> EngineerAgent<'a> {
         raw: &str,
         spec: &RefinedSpec,
     ) -> Result<BuildOutput, PipelineError> {
-        // Try parsing as JSON first
-        if let Ok(output) = serde_json::from_str::<BuildOutput>(raw) {
+        // Try extracting JSON (handles code fences and surrounding text)
+        if let Some(output) = super::extract_json::<BuildOutput>(raw) {
             return Ok(output);
         }
 
-        // If JSON parsing fails, generate a policy.yaml from the spec and
+        // If JSON extraction fails, generate a policy.yaml from the spec and
         // treat the response as raw source code
         let policy = PolicyYaml::from_spec(&spec.spec);
         let policy_yaml = serde_json::to_string_pretty(&policy).unwrap_or_default();

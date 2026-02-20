@@ -12,6 +12,9 @@ serde_json.workspace = true
 tracing.workspace = true
 tokio = { workspace = true, features = ["fs"] }
 thiserror = "2"
+anthropic-auth.workspace = true
+dirs.workspace = true
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
+tempfile.workspace = true

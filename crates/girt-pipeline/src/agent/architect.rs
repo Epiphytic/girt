@@ -61,14 +61,16 @@ impl<'a> ArchitectAgent<'a> {
 
         let response = self.llm.chat(&request).await?;
 
-        // Parse the JSON response
-        let refined: RefinedSpec = serde_json::from_str(&response.content).map_err(|e| {
+        // Parse the JSON response (handles code fences and surrounding text)
+        let refined: RefinedSpec = super::extract_json(&response.content).ok_or_else(|| {
             tracing::warn!(
                 raw_response = %response.content,
-                error = %e,
-                "Architect response was not valid JSON, using original spec"
+                "Architect response did not contain valid JSON, using original spec"
             );
-            PipelineError::LlmError(format!("Failed to parse architect response: {e}"))
+            PipelineError::LlmError(format!(
+                "Failed to parse architect response as JSON. Raw response: {}",
+                &response.content[..response.content.len().min(200)]
+            ))
         })?;
 
         tracing::info!(

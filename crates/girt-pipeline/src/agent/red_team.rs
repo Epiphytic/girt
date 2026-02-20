@@ -65,14 +65,21 @@ impl<'a> RedTeamAgent<'a> {
 
         let response = self.llm.chat(&request).await?;
 
-        let result: SecurityResult = serde_json::from_str(&response.content).map_err(|e| {
-            tracing::warn!(
-                raw_response = %response.content,
-                error = %e,
-                "Red Team response was not valid JSON"
-            );
-            PipelineError::SecurityError(format!("Failed to parse Red Team response: {e}"))
-        })?;
+        let result: SecurityResult = match super::extract_json(&response.content) {
+            Some(r) => r,
+            None => {
+                tracing::warn!(
+                    raw_response = %response.content,
+                    "Red Team response did not contain valid JSON, defaulting to fail"
+                );
+                SecurityResult {
+                    passed: false,
+                    exploits_attempted: 0,
+                    exploits_succeeded: 0,
+                    bug_tickets: vec![],
+                }
+            }
+        };
 
         tracing::info!(
             passed = result.passed,

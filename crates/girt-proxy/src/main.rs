@@ -23,9 +23,34 @@ use proxy::GirtProxy;
     about = "GIRT MCP Proxy -- routes agent requests through the Hookwise decision engine"
 )]
 struct Cli {
-    /// Path to girt.toml config file
-    #[arg(long, default_value = "girt.toml")]
-    config: PathBuf,
+    /// Path to girt.toml config file.
+    /// Default search order: ./girt.toml → ~/.config/girt/girt.toml
+    #[arg(long)]
+    config: Option<PathBuf>,
+}
+
+/// Resolve config path using standard search order:
+/// 1. Explicit --config flag
+/// 2. ./girt.toml (relative to cwd)
+/// 3. ~/.config/girt/girt.toml (user-level installation)
+fn resolve_config(explicit: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+    if let Some(p) = explicit {
+        return Ok(p);
+    }
+    let local = PathBuf::from("girt.toml");
+    if local.exists() {
+        return Ok(local);
+    }
+    if let Some(home) = dirs::home_dir() {
+        let user_config = home.join(".config").join("girt").join("girt.toml");
+        if user_config.exists() {
+            return Ok(user_config);
+        }
+    }
+    anyhow::bail!(
+        "No girt.toml found. Looked in: ./girt.toml and ~/.config/girt/girt.toml\n\
+         Run from the girt repo directory, or copy girt.toml to ~/.config/girt/girt.toml"
+    )
 }
 
 #[tokio::main]
@@ -38,11 +63,14 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    tracing::info!(config = %cli.config.display(), "Starting GIRT MCP proxy");
+    let config_path = resolve_config(cli.config)
+        .context("Failed to locate girt.toml")?;
+
+    tracing::info!(config = %config_path.display(), "Starting GIRT MCP proxy");
 
     // Load config
-    let config = GirtConfig::from_file(&cli.config)
-        .with_context(|| format!("Failed to load config from {}", cli.config.display()))?;
+    let config = GirtConfig::from_file(&config_path)
+        .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
     tracing::info!(
         provider = ?config.llm.provider,
         model = %config.llm.model,

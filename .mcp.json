@@ -1,8 +1,7 @@
 {
   "mcpServers": {
     "girt": {
-      "command": "cargo",
-      "args": ["run", "--manifest-path", "${CLAUDE_PLUGIN_ROOT}/Cargo.toml", "--bin", "girt", "--", "--wassette-bin", "wassette"],
+      "command": "girt",
       "env": {
         "GIRT_LOG": "info"
       }

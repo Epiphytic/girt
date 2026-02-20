@@ -608,7 +608,284 @@ llm_model = "claude-sonnet-4-6"    # LLM for decision evaluation
 
 ---
 
-## 11. Open Design Decisions (Future ADRs)
+## 11. Tool Artifact Format
+
+Every tool published to an OCI registry is a self-contained artifact bundle:
+
+```
+<tool_name>:<version>
+├── component.wasm          # Compiled WASM Component (wasm32-wasi)
+├── component.wit           # WIT interface definition
+├── policy.yaml             # Wassette permission declaration
+├── spec.json               # Architect's refined capability spec
+└── manifest.json           # GIRT metadata
+```
+
+### manifest.json
+
+```json
+{
+  "girt_version": "0.1.0",
+  "name": "github_issues",
+  "version": "0.3.0",
+  "description": "Query and manage GitHub issues with filtering and pagination",
+  "source_language": "rust",
+  "built_by": "girt-pipeline",
+  "built_at": "2026-02-20T14:30:00Z",
+  "build_iterations": 1,
+  "checksum": {
+    "wasm_sha256": "abc123...",
+    "wit_sha256": "def456..."
+  },
+  "dependencies": [],
+  "tags": ["github", "issues", "api"]
+}
+```
+
+This metadata enables:
+- **Registry search** — tags and description power the Creation Gate's registry lookup
+- **Provenance** — `built_by`, `built_at`, and `build_iterations` track how the tool was created
+- **Integrity** — SHA-256 checksums verify artifacts weren't tampered with
+- **Ecosystem queries** — the Architect uses `spec.json` to evaluate composability and duplication
+
+---
+
+## 12. Error Handling
+
+Each failure point in the pipeline has a defined recovery path:
+
+| Failure Point | Behavior | Recovery |
+|---|---|---|
+| **Creation Gate — policy rules crash** | Fail open to next layer (cache). Log error at ERROR level. | If all layers fail, escalate to HITL. Never silently allow. |
+| **Creation Gate — registry unreachable** | Skip registry lookup layer. Log at WARN. Continue to next layer. | Tool may be built even if a duplicate exists. Acceptable tradeoff vs. blocking. |
+| **Architect — LLM call fails** | Retry once. If second failure, pass the Operator's raw spec directly to the Engineer unrefined. Log at WARN. | Unrefined spec may produce a less reusable tool, but the pipeline isn't blocked. |
+| **Engineer — compilation fails** | Counts as a build iteration. Bug ticket with compiler errors routes back to Engineer. | Circuit breaker after 3 iterations. |
+| **Engineer — LLM call fails** | Retry once. If second failure, halt pipeline and escalate to user. | User can retry or provide code manually. |
+| **QA — test execution fails (Wassette error)** | Distinguish from functional failure. Wassette errors are infrastructure, not code bugs. Retry once. | If Wassette is persistently down, halt pipeline with infra error message. |
+| **Red Team — no exploits found** | This is the success path. Component passes security audit. | N/A |
+| **Publishing — OCI registry unreachable** | Cache locally. Queue for retry. Tool is still usable from local cache. | Background retry with exponential backoff. Notify user if retry exhausted. |
+| **Execution Gate — Wassette policy violation** | DENY. Return structured error to Operator with the specific policy rule violated. | Operator can request a new tool with broader permissions (goes through Creation Gate again). |
+| **Secret store — lookup fails** | Return structured error to component. Do NOT fall back to plaintext env vars. | User must fix secret store configuration. |
+
+### Structured Error Format
+
+All errors surfaced to the Operator follow a consistent shape:
+
+```json
+{
+  "error": "capability_build_failed",
+  "code": "GIRT_BUILD_CIRCUIT_BREAKER",
+  "details": {
+    "tool_name": "github_issues",
+    "attempts": 3,
+    "last_failure": "functional_defect",
+    "summary": "Pagination cursor handling fails on empty result sets"
+  }
+}
+```
+
+---
+
+## 13. Observability
+
+Per the global convention, GIRT uses structured JSON logging at all levels.
+
+### Log Events
+
+| Event | Level | Fields |
+|---|---|---|
+| Capability request received | INFO | `request_id`, `tool_name`, `source` |
+| Creation Gate decision | INFO | `request_id`, `decision` (allow/deny/defer/ask), `layer` (which layer decided), `rationale` |
+| Architect spec produced | INFO | `request_id`, `action` (build/extend), `spec_name`, `spec_version` |
+| Engineer build started | INFO | `request_id`, `iteration`, `language` |
+| Compilation result | INFO/ERROR | `request_id`, `iteration`, `success`, `error_summary` |
+| QA test suite result | INFO | `request_id`, `iteration`, `tests_run`, `tests_passed`, `tests_failed` |
+| Red Team audit result | INFO | `request_id`, `iteration`, `exploits_attempted`, `exploits_succeeded` |
+| Bug ticket created | WARN | `request_id`, `iteration`, `ticket_type`, `summary` |
+| Circuit breaker triggered | ERROR | `request_id`, `total_iterations`, `failure_summary` |
+| Tool published | INFO | `request_id`, `registry`, `tool_name`, `version`, `checksum` |
+| Execution Gate decision | INFO | `tool_id`, `decision`, `layer` |
+| Tool invocation | DEBUG | `tool_id`, `params_hash`, `duration_ms`, `result_size` |
+| Secret proxy call | INFO | `service_name`, `success` (no credential content logged) |
+
+### Metrics (Future)
+
+When a metrics backend is configured:
+- `girt.build.duration_ms` — histogram of end-to-end build times
+- `girt.build.iterations` — histogram of iterations per build
+- `girt.build.success_rate` — counter of pass/fail builds
+- `girt.gate.decisions` — counter by gate (creation/execution) and outcome (allow/deny/defer/ask)
+- `girt.cache.hit_rate` — ratio of cache hits to total lookups
+- `girt.execution.duration_ms` — histogram of tool invocation times
+
+---
+
+## 14. Resource Limits
+
+WASM execution through Wassette must be bounded to prevent resource exhaustion:
+
+| Resource | Default Limit | Configurable |
+|---|---|---|
+| **Memory** | 256 MB per component instance | Yes, in policy.yaml |
+| **CPU (Wasmtime fuel)** | 1,000,000,000 fuel units (~10s equivalent) | Yes, in policy.yaml |
+| **Execution timeout** | 30 seconds wall-clock | Yes, in girt.toml |
+| **Network response size** | 10 MB per HTTP response | Yes, in policy.yaml |
+| **Concurrent instances** | 1 per component (no parallel invocations of same tool) | Yes, in girt.toml |
+
+These limits are enforced by Wassette's Wasmtime configuration. GIRT generates the appropriate settings in `policy.yaml` based on the Architect's spec and the defaults in `girt.toml`.
+
+### Resource limit in policy.yaml
+
+```yaml
+version: "1.0"
+permissions:
+  network:
+    allow:
+      - host: "api.github.com"
+  storage: {}
+  environment: {}
+resources:
+  memory_mb: 128
+  fuel: 500000000
+  timeout_seconds: 15
+  max_response_bytes: 5242880
+```
+
+---
+
+## 15. Testing Strategy for GIRT Itself
+
+GIRT is tested at three levels:
+
+### 15.1 Unit Tests
+
+- **Hookwise decision engine:** Test each cascade layer in isolation. Mock registry, embedding store, and LLM. Verify correct short-circuiting behavior.
+- **Queue operations:** Test atomic file moves, concurrent access, malformed request handling.
+- **MCP proxy:** Test request interception, routing, and response forwarding.
+- **Secret wrapper:** Test host function injection, secret lookup, and response sanitization. Verify secrets never appear in logs or WASM memory.
+- **OCI client:** Test artifact push/pull, cache TTL, tag resolution.
+
+### 15.2 Integration Tests
+
+- **Full build pipeline (mocked LLMs):** Feed a capability spec through the pipeline with deterministic LLM responses. Verify the correct sequence: Creation Gate → Architect → Engineer → QA → Red Team → Publish.
+- **Wassette integration:** Load a known-good .wasm component into Wassette via GIRT. Verify execution, policy enforcement, and hot-reload.
+- **Bug ticket loop:** Simulate QA failure, verify the ticket routes to Engineer, verify the circuit breaker fires after 3 iterations.
+- **Registry round-trip:** Build a tool, publish to a local OCI registry, verify it's discoverable by the Creation Gate's registry lookup.
+
+### 15.3 End-to-End Tests
+
+- **Real LLM, real Wassette:** Submit a capability request ("build a tool that converts Celsius to Fahrenheit"). Verify the full pipeline produces a working, published WASM component that returns correct results.
+- **Rejection path:** Submit a known-dangerous request (e.g., "read /etc/shadow"). Verify the Creation Gate denies it without reaching the Engineer.
+- **DEFER path:** Pre-load a "temperature converter" tool in the registry. Submit a similar request. Verify the Creation Gate defers to the existing tool.
+- **Circuit breaker E2E:** Submit a request that's intentionally difficult to implement correctly. Verify the pipeline halts after 3 iterations and escalates.
+
+### 15.4 Testing Convention
+
+Per global conventions:
+- E2E tests must pass before merging to main
+- Tests are never disabled to force a build to pass
+- Tests are only updated when business logic changes
+
+---
+
+## 16. Implementation Phases
+
+### Phase 0: Foundation (Weeks 1-2)
+
+**Goal:** Skeleton project with MCP proxy and Wassette integration.
+
+- [ ] Initialize Rust project with Cargo workspace
+- [ ] Implement minimal MCP proxy (stdio transport, pass-through to Wassette)
+- [ ] Verify: agent connects through GIRT to Wassette, existing tools work
+- [ ] Set up CI (build, lint, unit tests)
+- [ ] Establish OCI registry structure on ghcr.io/epiphytic
+
+**Deliverable:** GIRT as a transparent MCP proxy. No decision engine, no build pipeline. Just a working pipe between agent and Wassette.
+
+### Phase 1: Decision Engine (Weeks 3-4)
+
+**Goal:** Creation and Execution gates with the hookwise cascade.
+
+- [ ] Implement policy rules layer (pattern matching for known-good/known-bad)
+- [ ] Implement decision cache (spec hash → decision)
+- [ ] Implement registry lookup layer (OCI registry query)
+- [ ] Implement CLI/native check layer (known CLI utility list)
+- [ ] Implement LLM evaluation layer (Anthropic API call)
+- [ ] Implement HITL layer (surfaces to user via MCP or plugin)
+- [ ] Wire Creation Gate into `request_capability` interception
+- [ ] Wire Execution Gate into `call_tool` interception
+- [ ] Unit + integration tests for each layer
+
+**Deliverable:** GIRT intercepts tool calls and capability requests, makes allow/deny/defer/ask decisions. No build pipeline yet — allowed creation requests return "not yet implemented."
+
+### Phase 2: Build Pipeline (Weeks 5-8)
+
+**Goal:** Architect → Engineer → QA → Red Team pipeline, producing real WASM tools.
+
+- [ ] Implement Architect agent (LLM call with spec refinement prompt)
+- [ ] Implement Engineer agent (LLM call → Rust code → `cargo component build`)
+- [ ] Implement QA agent (LLM generates test payloads → executes via Wassette)
+- [ ] Implement Red Team agent (LLM generates exploit payloads → executes via Wassette)
+- [ ] Implement bug ticket routing (QA/Red Team → Engineer)
+- [ ] Implement circuit breaker (max 3 iterations → HITL escalation)
+- [ ] Implement policy.yaml generation from Architect spec
+- [ ] Implement OCI publishing on success
+- [ ] Implement local cache for built tools
+- [ ] Implement hot-reload notification (`tools/list_changed`)
+- [ ] Integration tests: full pipeline with mocked LLMs
+- [ ] E2E test: real LLM builds a simple tool end-to-end
+
+**Deliverable:** Complete build pipeline. An agent can request a capability and receive a working WASM tool.
+
+### Phase 3: Claude Code Plugin (Weeks 9-11)
+
+**Goal:** Package GIRT as a Claude Code plugin with agent team orchestration.
+
+- [ ] Create plugin.json manifest
+- [ ] Create agent definitions (pipeline-lead, architect, engineer, qa, red-team)
+- [ ] Implement file-based queue (`~/.girt/queue/`)
+- [ ] Implement Pipeline Lead orchestration logic
+- [ ] Create skills (request-capability, list-tools, promote-tool)
+- [ ] Create hooks (capability-intercept, tool-call-gate)
+- [ ] Create commands (/girt-status, /girt-build, /girt-registry)
+- [ ] Wire MCP servers (.mcp.json for Wassette + GIRT proxy)
+- [ ] Integration test: full pipeline via Claude Code agent team
+- [ ] E2E test: user requests capability, team builds and delivers it
+
+**Deliverable:** Installable Claude Code plugin. Full pipeline runs as an agent team.
+
+### Phase 4: Secret Wrapper + Standard Library (Weeks 12-14)
+
+**Goal:** Zero-knowledge secret handling and pre-built tool ecosystem.
+
+- [ ] Implement `host_auth_proxy` Wasmtime host function
+- [ ] Implement secret store facade (env, keychain backends)
+- [ ] Build standard library tools (HTTP client, JSON, file I/O, GitHub, GitLab, text processing, crypto)
+- [ ] Publish standard library to Epiphytic Public Registry
+- [ ] Implement similarity check layer (embedding-based spec matching)
+- [ ] E2E test: tool uses secret proxy to call authenticated API
+
+**Deliverable:** Secret handling works. Standard library available. Similarity matching reduces duplicate builds.
+
+### Phase 5: Hardening + Multi-Language (Weeks 15-18)
+
+**Goal:** Production readiness.
+
+- [ ] Add Go support to Engineer agent
+- [ ] Add AssemblyScript support to Engineer agent
+- [ ] Implement resource limits in policy.yaml generation
+- [ ] Implement structured logging at all pipeline stages
+- [ ] Implement metrics collection (optional backend)
+- [ ] Security audit of the GIRT proxy itself (not just generated tools)
+- [ ] Load testing: concurrent capability requests
+- [ ] Documentation: user guide, plugin installation, registry contribution guide
+- [ ] Implement tool promotion pipeline (private → public)
+
+**Deliverable:** Production-grade GIRT with multi-language support, observability, and hardened security.
+
+---
+
+## 17. Open Design Decisions (Future ADRs)
 
 These items need dedicated Architecture Decision Records before implementation:
 

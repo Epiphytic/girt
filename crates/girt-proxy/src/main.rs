@@ -3,6 +3,9 @@ use std::sync::Arc;
 use anyhow::Result;
 use clap::Parser;
 use girt_core::engine::DecisionEngine;
+use girt_pipeline::cache::ToolCache;
+use girt_pipeline::llm::StubLlmClient;
+use girt_pipeline::publish::Publisher;
 use rmcp::{
     ServiceExt,
     transport::{ConfigureCommandExt, TokioChildProcess},
@@ -49,6 +52,19 @@ async fn main() -> Result<()> {
     let engine = Arc::new(DecisionEngine::with_defaults());
     tracing::info!("Decision engine initialized");
 
+    // Initialize LLM client
+    // TODO: Replace with real Anthropic client when anthropic feature is enabled
+    let llm: Arc<dyn girt_pipeline::llm::LlmClient> = Arc::new(StubLlmClient::constant(
+        r#"{"error": "LLM not configured. Set ANTHROPIC_API_KEY to enable builds."}"#,
+    ));
+    tracing::info!("LLM client initialized (stub mode)");
+
+    // Initialize tool cache and publisher
+    let cache = ToolCache::new(ToolCache::default_path());
+    cache.init().await?;
+    let publisher = Arc::new(Publisher::new(cache));
+    tracing::info!("Tool cache initialized");
+
     // Spawn Wassette as a child process and connect as MCP client
     let wassette_transport =
         TokioChildProcess::new(Command::new(&cli.wassette_bin).configure(|cmd| {
@@ -68,8 +84,8 @@ async fn main() -> Result<()> {
         "Connected to Wassette"
     );
 
-    // Create proxy handler with decision engine
-    let proxy = GirtProxy::new(wassette_peer, wassette_init, engine);
+    // Create proxy handler with decision engine and pipeline
+    let proxy = GirtProxy::new(wassette_peer, wassette_init, engine, llm, publisher);
 
     // Serve on stdio (agent connects here)
     let stdio = rmcp::transport::io::stdio();

@@ -574,6 +574,7 @@ dependencies = [
  "anyhow",
  "clap",
  "girt-core",
+ "girt-pipeline",
  "rmcp",
  "serde",
  "serde_json",

@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 girt-core = { path = "../girt-core" }
+girt-pipeline = { path = "../girt-pipeline" }
 rmcp.workspace = true
 tokio.workspace = true
 serde.workspace = true

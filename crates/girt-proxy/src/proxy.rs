@@ -3,6 +3,10 @@ use std::sync::Arc;
 use girt_core::decision::{Decision, GateKind};
 use girt_core::engine::DecisionEngine;
 use girt_core::spec::{CapabilitySpec, ExecutionRequest, GateInput};
+use girt_pipeline::llm::LlmClient;
+use girt_pipeline::orchestrator::{Orchestrator, PipelineOutcome};
+use girt_pipeline::publish::Publisher;
+use girt_pipeline::types::{CapabilityRequest, RequestSource};
 use rmcp::{
     ErrorData as McpError, Peer, RoleClient, RoleServer, ServerHandler,
     model::{
@@ -14,15 +18,23 @@ use rmcp::{
     },
     service::RequestContext,
 };
+use tokio::sync::Mutex;
 
 /// MCP proxy that routes agent requests through decision gates to Wassette.
 ///
 /// Phase 1: Intercepts call_tool through Execution Gate, provides
 /// request_capability tool through Creation Gate.
+///
+/// Phase 2: When Creation Gate allows, triggers the build pipeline
+/// (Architect -> Engineer -> QA -> Red Team) and publishes the result.
 pub struct GirtProxy {
     wassette: Peer<RoleClient>,
     wassette_capabilities: ServerCapabilities,
     engine: Arc<DecisionEngine>,
+    llm: Arc<dyn LlmClient>,
+    publisher: Arc<Publisher>,
+    /// Server peer for sending notifications (set during handler calls).
+    server_peer: Arc<Mutex<Option<Peer<RoleServer>>>>,
 }
 
 impl GirtProxy {
@@ -30,11 +42,16 @@ impl GirtProxy {
         wassette: Peer<RoleClient>,
         wassette_init: InitializeResult,
         engine: Arc<DecisionEngine>,
+        llm: Arc<dyn LlmClient>,
+        publisher: Arc<Publisher>,
     ) -> Self {
         Self {
             wassette,
             wassette_capabilities: wassette_init.capabilities,
             engine,
+            llm,
+            publisher,
+            server_peer: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -138,8 +155,11 @@ impl ServerHandler for GirtProxy {
     async fn initialize(
         &self,
         _request: InitializeRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<InitializeResult, McpError> {
+        // Capture the server peer for later notifications
+        let mut peer_lock = self.server_peer.lock().await;
+        *peer_lock = Some(context.peer.clone());
         Ok(girt_info(&self.wassette_capabilities))
     }
 
@@ -159,6 +179,32 @@ impl ServerHandler for GirtProxy {
 
         // Add GIRT's own tools
         result.tools.push(request_capability_tool());
+
+        // Add cached tools (built by pipeline)
+        if let Ok(cached_names) = self.publisher.cache().list().await {
+            for name in cached_names {
+                if let Ok(Some(artifact)) = self.publisher.cache().get(&name).await {
+                    let tool = Tool {
+                        name: artifact.spec.name.into(),
+                        title: None,
+                        description: Some(artifact.spec.description.into()),
+                        input_schema: artifact
+                            .spec
+                            .inputs
+                            .as_object()
+                            .cloned()
+                            .unwrap_or_default()
+                            .into(),
+                        output_schema: None,
+                        annotations: None,
+                        execution: None,
+                        icons: None,
+                        meta: None,
+                    };
+                    result.tools.push(tool);
+                }
+            }
+        }
 
         Ok(result)
     }
@@ -329,7 +375,7 @@ impl GirtProxy {
             "Evaluating capability request through Creation Gate"
         );
 
-        let input = GateInput::Creation(spec);
+        let input = GateInput::Creation(spec.clone());
 
         let gate_result = self
             .engine
@@ -343,11 +389,127 @@ impl GirtProxy {
             "Creation Gate decision"
         );
 
-        let is_error = matches!(gate_result.decision, Decision::Deny { .. });
+        match &gate_result.decision {
+            Decision::Allow => {
+                // Creation allowed -- trigger build pipeline
+                self.trigger_build(spec).await
+            }
+            Decision::Deny { .. } => Ok(make_tool_result(
+                decision_to_content(&gate_result.decision),
+                true,
+            )),
+            _ => Ok(make_tool_result(
+                decision_to_content(&gate_result.decision),
+                false,
+            )),
+        }
+    }
 
-        Ok(make_tool_result(
-            decision_to_content(&gate_result.decision),
-            is_error,
-        ))
+    /// Trigger the build pipeline for an approved capability request.
+    async fn trigger_build(&self, spec: CapabilitySpec) -> Result<CallToolResult, McpError> {
+        let cap_request = CapabilityRequest::new(spec, RequestSource::Operator);
+        let tool_name = cap_request.spec.name.clone();
+
+        tracing::info!(
+            id = %cap_request.id,
+            tool = %tool_name,
+            "Triggering build pipeline"
+        );
+
+        let orchestrator = Orchestrator::new(self.llm.as_ref());
+        let outcome = orchestrator.run(&cap_request).await;
+
+        match outcome {
+            PipelineOutcome::Built(artifact) => {
+                tracing::info!(
+                    tool = %tool_name,
+                    iterations = artifact.build_iterations,
+                    "Build pipeline succeeded"
+                );
+
+                // Publish to local cache
+                match self.publisher.publish(&artifact).await {
+                    Ok(result) => {
+                        tracing::info!(
+                            tool = %result.tool_name,
+                            path = %result.local_path.display(),
+                            "Tool published"
+                        );
+
+                        // Send tools/list_changed notification
+                        self.notify_tools_changed().await;
+
+                        let response = serde_json::json!({
+                            "status": "built",
+                            "tool_name": result.tool_name,
+                            "build_iterations": artifact.build_iterations,
+                            "tests_run": artifact.qa_result.tests_run,
+                            "tests_passed": artifact.qa_result.tests_passed,
+                            "exploits_attempted": artifact.security_result.exploits_attempted,
+                            "exploits_succeeded": artifact.security_result.exploits_succeeded,
+                        });
+                        Ok(make_tool_result(
+                            vec![Content::text(response.to_string())],
+                            false,
+                        ))
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "Failed to publish artifact");
+                        Ok(make_tool_result(
+                            vec![Content::text(format!(
+                                "{{\"status\": \"publish_failed\", \"error\": \"{e}\"}}"
+                            ))],
+                            true,
+                        ))
+                    }
+                }
+            }
+            PipelineOutcome::RecommendExtend { target, features } => {
+                tracing::info!(
+                    tool = %tool_name,
+                    target = %target,
+                    "Architect recommends extending existing tool"
+                );
+                let response = serde_json::json!({
+                    "status": "recommend_extend",
+                    "target_tool": target,
+                    "features": features,
+                    "message": format!("Consider extending '{}' instead of building a new tool", target),
+                });
+                Ok(make_tool_result(
+                    vec![Content::text(response.to_string())],
+                    false,
+                ))
+            }
+            PipelineOutcome::Failed(e) => {
+                tracing::error!(
+                    tool = %tool_name,
+                    error = %e,
+                    "Build pipeline failed"
+                );
+                let response = serde_json::json!({
+                    "status": "build_failed",
+                    "error": e.to_string(),
+                });
+                Ok(make_tool_result(
+                    vec![Content::text(response.to_string())],
+                    true,
+                ))
+            }
+        }
+    }
+
+    /// Send a tools/list_changed notification to the connected agent.
+    async fn notify_tools_changed(&self) {
+        let peer_lock = self.server_peer.lock().await;
+        if let Some(peer) = peer_lock.as_ref() {
+            if let Err(e) = peer.notify_tool_list_changed().await {
+                tracing::warn!(error = %e, "Failed to send tools/list_changed notification");
+            } else {
+                tracing::info!("Sent tools/list_changed notification");
+            }
+        } else {
+            tracing::warn!("No server peer available for tools/list_changed notification");
+        }
     }
 }

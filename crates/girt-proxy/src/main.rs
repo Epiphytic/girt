@@ -11,8 +11,10 @@ use girt_runtime::LifecycleManager;
 use rmcp::ServiceExt;
 use tracing_subscriber::{EnvFilter, fmt};
 
+mod evaluator;
 mod proxy;
 
+use evaluator::GateLlmEvaluator;
 use proxy::GirtProxy;
 
 #[derive(Parser)]
@@ -47,15 +49,19 @@ async fn main() -> Result<()> {
         "Config loaded"
     );
 
-    // Initialize the Hookwise decision engine
-    let engine = Arc::new(DecisionEngine::with_defaults());
-    tracing::info!("Decision engine initialized");
-
     // Initialize LLM client from config
     let llm = config
         .build_llm_client()
         .context("Failed to initialize LLM client")?;
     tracing::info!("LLM client initialized");
+
+    // Initialize the Hookwise decision engine with real LLM evaluators
+    // Both gates share the same underlying client via Arc
+    let engine = Arc::new(DecisionEngine::with_real_llm(
+        Box::new(GateLlmEvaluator::new(Arc::clone(&llm))),
+        Box::new(GateLlmEvaluator::new(Arc::clone(&llm))),
+    ));
+    tracing::info!("Decision engine initialized with real LLM evaluator");
 
     // Initialize tool cache and publisher
     let cache = ToolCache::new(ToolCache::default_path());

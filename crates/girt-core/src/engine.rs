@@ -7,6 +7,7 @@ use crate::layers::hitl::HitlLayer;
 use crate::layers::llm::LlmEvaluationLayer;
 use crate::layers::policy::PolicyRulesLayer;
 use crate::layers::registry::RegistryLookupLayer;
+use crate::layers::similarity::SimilarityLayer;
 use crate::spec::GateInput;
 
 /// The Hookwise decision engine -- orchestrates the cascade of layers.
@@ -24,6 +25,7 @@ pub struct CreationLayers {
     pub cache: CacheLayer,
     pub registry: RegistryLookupLayer,
     pub cli_check: CliCheckLayer,
+    pub similarity: SimilarityLayer,
     pub llm: LlmEvaluationLayer,
     pub hitl: HitlLayer,
 }
@@ -44,6 +46,33 @@ impl DecisionEngine {
         }
     }
 
+    /// Create an engine with a real LLM evaluator for the gate layers.
+    ///
+    /// Pass two separate evaluator instances (they share the same underlying
+    /// client via `Arc` internally — see `GateLlmEvaluator` in girt-proxy).
+    pub fn with_real_llm(
+        creation_evaluator: Box<dyn crate::layers::llm::LlmEvaluator>,
+        execution_evaluator: Box<dyn crate::layers::llm::LlmEvaluator>,
+    ) -> Self {
+        Self {
+            creation_layers: CreationLayers {
+                policy: PolicyRulesLayer::with_defaults(),
+                cache: CacheLayer::new(),
+                registry: RegistryLookupLayer::new(vec![]),
+                cli_check: CliCheckLayer::with_defaults(),
+                similarity: SimilarityLayer::new(vec![]),
+                llm: LlmEvaluationLayer::new(creation_evaluator),
+                hitl: HitlLayer::with_default(),
+            },
+            execution_layers: ExecutionLayers {
+                policy: PolicyRulesLayer::with_defaults(),
+                cache: CacheLayer::new(),
+                llm: LlmEvaluationLayer::new(execution_evaluator),
+                hitl: HitlLayer::with_default(),
+            },
+        }
+    }
+
     /// Create an engine with default/stub layers for development and testing.
     pub fn with_defaults() -> Self {
         Self {
@@ -52,6 +81,7 @@ impl DecisionEngine {
                 cache: CacheLayer::new(),
                 registry: RegistryLookupLayer::new(vec![]),
                 cli_check: CliCheckLayer::with_defaults(),
+                similarity: SimilarityLayer::new(vec![]),
                 llm: LlmEvaluationLayer::with_stub(),
                 hitl: HitlLayer::with_default(),
             },
@@ -95,6 +125,7 @@ impl DecisionEngine {
                 DecisionLayerEnum::RegistryLookup,
             ),
             (&self.creation_layers.cli_check, DecisionLayerEnum::CliCheck),
+            (&self.creation_layers.similarity, DecisionLayerEnum::Similarity),
             (&self.creation_layers.llm, DecisionLayerEnum::LlmEvaluation),
             (&self.creation_layers.hitl, DecisionLayerEnum::Hitl),
         ];

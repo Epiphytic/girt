@@ -22,3 +22,5 @@ dirs.workspace = true
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
+tempfile.workspace = true
+girt-pipeline = { path = "../girt-pipeline" }

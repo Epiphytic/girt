@@ -5,4 +5,5 @@ pub mod llm;
 pub mod orchestrator;
 pub mod publish;
 pub mod queue;
+pub mod stdlib;
 pub mod types;

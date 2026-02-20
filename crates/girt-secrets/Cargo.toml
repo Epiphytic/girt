@@ -1,0 +1,17 @@
+[package]
+name = "girt-secrets"
+version = "0.1.0"
+description = "Zero-knowledge secret handling for GIRT -- wraps Wassette credentials so secrets never enter WASM memory"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["fs"] }
+thiserror = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }

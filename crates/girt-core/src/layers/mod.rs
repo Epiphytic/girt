@@ -4,6 +4,7 @@ pub mod hitl;
 pub mod llm;
 pub mod policy;
 pub mod registry;
+pub mod similarity;
 
 use std::future::Future;
 use std::pin::Pin;

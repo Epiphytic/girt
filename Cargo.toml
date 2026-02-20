@@ -32,3 +32,4 @@ thiserror = "2"
 sha2 = "0.10"
 hex = "0.4"
 dirs = "6"
+anthropic-auth = { version = "0.1", features = ["async"] }

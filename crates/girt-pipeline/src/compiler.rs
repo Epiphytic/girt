@@ -34,6 +34,10 @@ impl WasmCompiler {
         std::fs::create_dir_all(project_dir.join("src"))?;
         std::fs::create_dir_all(project_dir.join("wit"))?;
 
+        // cargo-component requires package names with dashes (not underscores)
+        // for valid component labels.
+        let package_name = input.tool_name.replace('_', "-");
+
         let cargo_toml = format!(
             r#"[package]
 name = "{name}"
@@ -51,7 +55,7 @@ crate-type = ["cdylib"]
 [package.metadata.component]
 package = "girt:tool@0.1.0"
 "#,
-            name = input.tool_name,
+            name = package_name,
             version = input.tool_version,
         );
         std::fs::write(project_dir.join("Cargo.toml"), cargo_toml)?;

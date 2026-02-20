@@ -11,6 +11,7 @@ name = "girt"
 path = "src/main.rs"
 
 [dependencies]
+girt-core = { path = "../girt-core" }
 rmcp.workspace = true
 tokio.workspace = true
 serde.workspace = true

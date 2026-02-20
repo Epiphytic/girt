@@ -1,5 +1,8 @@
+use std::sync::Arc;
+
 use anyhow::Result;
 use clap::Parser;
+use girt_core::engine::DecisionEngine;
 use rmcp::{
     ServiceExt,
     transport::{ConfigureCommandExt, TokioChildProcess},
@@ -14,7 +17,7 @@ use proxy::GirtProxy;
 #[derive(Parser)]
 #[command(
     name = "girt",
-    about = "GIRT MCP Proxy — routes agent requests to Wassette"
+    about = "GIRT MCP Proxy -- routes agent requests through decision gates to Wassette"
 )]
 struct Cli {
     /// Path to the Wassette binary
@@ -42,6 +45,10 @@ async fn main() -> Result<()> {
         "Starting GIRT MCP proxy"
     );
 
+    // Initialize the Hookwise decision engine with default layers
+    let engine = Arc::new(DecisionEngine::with_defaults());
+    tracing::info!("Decision engine initialized");
+
     // Spawn Wassette as a child process and connect as MCP client
     let wassette_transport =
         TokioChildProcess::new(Command::new(&cli.wassette_bin).configure(|cmd| {
@@ -61,8 +68,8 @@ async fn main() -> Result<()> {
         "Connected to Wassette"
     );
 
-    // Create proxy handler that forwards to Wassette
-    let proxy = GirtProxy::new(wassette_peer, wassette_init);
+    // Create proxy handler with decision engine
+    let proxy = GirtProxy::new(wassette_peer, wassette_init, engine);
 
     // Serve on stdio (agent connects here)
     let stdio = rmcp::transport::io::stdio();

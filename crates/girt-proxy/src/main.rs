@@ -1,16 +1,13 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use girt_core::engine::DecisionEngine;
 use girt_pipeline::cache::ToolCache;
-use girt_pipeline::llm::StubLlmClient;
+use girt_pipeline::config::GirtConfig;
 use girt_pipeline::publish::Publisher;
-use rmcp::{
-    ServiceExt,
-    transport::{ConfigureCommandExt, TokioChildProcess},
-};
-use tokio::process::Command;
+use rmcp::ServiceExt;
 use tracing_subscriber::{EnvFilter, fmt};
 
 mod proxy;
@@ -20,22 +17,17 @@ use proxy::GirtProxy;
 #[derive(Parser)]
 #[command(
     name = "girt",
-    about = "GIRT MCP Proxy -- routes agent requests through decision gates to Wassette"
+    about = "GIRT MCP Proxy -- routes agent requests through the Hookwise decision engine"
 )]
 struct Cli {
-    /// Path to the Wassette binary
-    #[arg(long, default_value = "wassette")]
-    wassette_bin: String,
-
-    /// Arguments to pass to Wassette
-    #[arg(long, num_args = 0..)]
-    wassette_args: Vec<String>,
+    /// Path to girt.toml config file
+    #[arg(long, default_value = "girt.toml")]
+    config: PathBuf,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize structured logging
-    // Logs go to stderr so they don't interfere with MCP stdio transport on stdout
+    // Logs go to stderr — stdout is reserved for MCP stdio transport
     fmt()
         .with_env_filter(EnvFilter::from_env("GIRT_LOG"))
         .with_writer(std::io::stderr)
@@ -43,21 +35,26 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    tracing::info!(config = %cli.config.display(), "Starting GIRT MCP proxy");
+
+    // Load config
+    let config = GirtConfig::from_file(&cli.config)
+        .with_context(|| format!("Failed to load config from {}", cli.config.display()))?;
     tracing::info!(
-        wassette_bin = %cli.wassette_bin,
-        "Starting GIRT MCP proxy"
+        provider = ?config.llm.provider,
+        model = %config.llm.model,
+        "Config loaded"
     );
 
-    // Initialize the Hookwise decision engine with default layers
+    // Initialize the Hookwise decision engine
     let engine = Arc::new(DecisionEngine::with_defaults());
     tracing::info!("Decision engine initialized");
 
-    // Initialize LLM client
-    // TODO: Replace with real Anthropic client when anthropic feature is enabled
-    let llm: Arc<dyn girt_pipeline::llm::LlmClient> = Arc::new(StubLlmClient::constant(
-        r#"{"error": "LLM not configured. Set ANTHROPIC_API_KEY to enable builds."}"#,
-    ));
-    tracing::info!("LLM client initialized (stub mode)");
+    // Initialize LLM client from config
+    let llm = config
+        .build_llm_client()
+        .context("Failed to initialize LLM client")?;
+    tracing::info!("LLM client initialized");
 
     // Initialize tool cache and publisher
     let cache = ToolCache::new(ToolCache::default_path());
@@ -65,27 +62,8 @@ async fn main() -> Result<()> {
     let publisher = Arc::new(Publisher::new(cache));
     tracing::info!("Tool cache initialized");
 
-    // Spawn Wassette as a child process and connect as MCP client
-    let wassette_transport =
-        TokioChildProcess::new(Command::new(&cli.wassette_bin).configure(|cmd| {
-            cmd.args(&cli.wassette_args);
-        }))?;
-
-    let wassette_service = ().serve(wassette_transport).await?;
-
-    let wassette_init = wassette_service
-        .peer_info()
-        .cloned()
-        .expect("Wassette should return server info on initialize");
-    let wassette_peer = wassette_service.peer().clone();
-
-    tracing::info!(
-        server = ?wassette_init.server_info,
-        "Connected to Wassette"
-    );
-
-    // Create proxy handler with decision engine and pipeline
-    let proxy = GirtProxy::new(wassette_peer, wassette_init, engine, llm, publisher);
+    // Create proxy handler
+    let proxy = GirtProxy::new(engine, llm, publisher);
 
     // Serve on stdio (agent connects here)
     let stdio = rmcp::transport::io::stdio();
@@ -93,7 +71,6 @@ async fn main() -> Result<()> {
 
     tracing::info!("GIRT proxy serving on stdio");
 
-    // Run until the agent disconnects
     server.waiting().await?;
 
     tracing::info!("GIRT proxy shutting down");

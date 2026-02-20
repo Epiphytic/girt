@@ -117,6 +117,100 @@ impl LlmClient for OpenAiCompatibleClient {
     }
 }
 
+/// Anthropic Messages API client.
+///
+/// Calls `POST /v1/messages` with the Claude model specified in config.
+/// Reads the API key from the `ANTHROPIC_API_KEY` env var or the value
+/// passed at construction time.
+pub struct AnthropicLlmClient {
+    http: reqwest::Client,
+    model: String,
+    api_key: String,
+}
+
+impl AnthropicLlmClient {
+    pub fn new(model: String, api_key: String) -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            model,
+            api_key,
+        }
+    }
+
+    /// Construct from environment, falling back to the provided key.
+    pub fn from_env_or(model: String, api_key_fallback: Option<String>) -> Result<Self, PipelineError> {
+        let api_key = std::env::var("ANTHROPIC_API_KEY")
+            .ok()
+            .or(api_key_fallback)
+            .ok_or_else(|| {
+                PipelineError::LlmError(
+                    "Anthropic API key not found. Set ANTHROPIC_API_KEY or provide api_key in girt.toml".into(),
+                )
+            })?;
+        Ok(Self::new(model, api_key))
+    }
+}
+
+impl LlmClient for AnthropicLlmClient {
+    fn chat<'a>(
+        &'a self,
+        request: &'a LlmRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<LlmResponse, PipelineError>> + Send + 'a>> {
+        Box::pin(async move {
+            let messages: Vec<serde_json::Value> = request
+                .messages
+                .iter()
+                .map(|m| serde_json::json!({"role": m.role, "content": m.content}))
+                .collect();
+
+            let body = serde_json::json!({
+                "model": self.model,
+                "max_tokens": request.max_tokens,
+                "system": request.system_prompt,
+                "messages": messages,
+            });
+
+            let resp = self
+                .http
+                .post("https://api.anthropic.com/v1/messages")
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", "2023-06-01")
+                .header("content-type", "application/json")
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| PipelineError::LlmError(format!("HTTP request failed: {e}")))?;
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(PipelineError::LlmError(format!(
+                    "Anthropic API returned {status}: {body}"
+                )));
+            }
+
+            let json: serde_json::Value = resp
+                .json()
+                .await
+                .map_err(|e| PipelineError::LlmError(format!("Failed to parse response: {e}")))?;
+
+            let content = json["content"]
+                .as_array()
+                .and_then(|arr| arr.first())
+                .and_then(|block| block["text"].as_str())
+                .ok_or_else(|| {
+                    PipelineError::LlmError(format!(
+                        "Unexpected Anthropic response shape: {}",
+                        serde_json::to_string_pretty(&json).unwrap_or_default()
+                    ))
+                })?
+                .to_string();
+
+            Ok(LlmResponse { content })
+        })
+    }
+}
+
 /// Stub LLM client that returns deterministic responses for testing.
 pub struct StubLlmClient {
     responses: Vec<String>,

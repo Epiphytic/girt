@@ -1,8 +1,17 @@
 [llm]
-provider = "openai-compatible"
-base_url = "http://localhost:8000/v1"
-model = "zai-org/GLM-4.7-Flash"
+# provider options:
+#   "anthropic"        — Anthropic Claude (recommended; set ANTHROPIC_API_KEY env var)
+#   "openai-compatible" — Any OpenAI-compatible endpoint (e.g. vLLM, Ollama)
+#   "stub"             — Deterministic no-op for testing
+provider = "anthropic"
+model = "claude-sonnet-4-5"
+# api_key = "sk-ant-..."  # or set ANTHROPIC_API_KEY env var
 max_tokens = 4096
+
+# Uncomment to use local vLLM / GLM instead:
+# provider = "openai-compatible"
+# base_url = "http://localhost:8000/v1"
+# model = "zai-org/GLM-4.7-Flash"
 
 [registry]
 url = "ghcr.io/epiphytic/girt-tools"

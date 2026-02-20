@@ -1,6 +1,12 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use crate::compiler::WasmCompiler;
 use crate::error::PipelineError;
+use crate::llm::LlmClient;
+use crate::metrics::PipelineMetrics;
+use crate::orchestrator::{Orchestrator, PipelineOutcome};
+use crate::publish::Publisher;
 use crate::types::{CapabilityRequest, RequestStatus};
 
 /// File-based queue for capability requests.
@@ -158,6 +164,147 @@ impl Queue {
     }
 }
 
+#[derive(Debug)]
+pub enum ProcessResult {
+    Built {
+        name: String,
+        oci_reference: Option<String>,
+    },
+    Extended {
+        target: String,
+        features: Vec<String>,
+    },
+    Failed(PipelineError),
+}
+
+pub struct QueueConsumer {
+    queue: Queue,
+    llm: Arc<dyn LlmClient>,
+    publisher: Publisher,
+    metrics: Arc<PipelineMetrics>,
+}
+
+impl QueueConsumer {
+    pub fn new(
+        queue: Queue,
+        llm: Arc<dyn LlmClient>,
+        publisher: Publisher,
+        metrics: Arc<PipelineMetrics>,
+    ) -> Self {
+        Self {
+            queue,
+            llm,
+            publisher,
+            metrics,
+        }
+    }
+
+    pub fn queue(&self) -> &Queue {
+        &self.queue
+    }
+
+    pub async fn process_next(
+        &self,
+        compiler: &WasmCompiler,
+        registry_url: Option<&str>,
+        tag: Option<&str>,
+    ) -> Result<Option<ProcessResult>, PipelineError> {
+        let request = match self.queue.claim_next().await? {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+
+        self.metrics.record_build_started();
+        tracing::info!(id = %request.id, name = %request.spec.name, "Processing request");
+
+        let orchestrator = Orchestrator::new(self.llm.as_ref());
+        let outcome = orchestrator.run(&request).await;
+
+        match outcome {
+            PipelineOutcome::Built(artifact) => {
+                let compile_input = crate::compiler::CompileInput {
+                    source_code: artifact.build_output.source_code.clone(),
+                    wit_definition: artifact.build_output.wit_definition.clone(),
+                    tool_name: artifact.spec.name.clone(),
+                    tool_version: "0.1.0".into(),
+                };
+
+                let compile_output = compiler.compile(&compile_input).await?;
+
+                self.publisher
+                    .publish_with_wasm(&artifact, &compile_output.wasm_path)
+                    .await?;
+
+                let oci_reference = if let (Some(url), Some(t)) = (registry_url, tag) {
+                    Some(
+                        self.publisher
+                            .push_oci(&artifact, &compile_output.wasm_path, url, t)
+                            .await?,
+                    )
+                } else {
+                    None
+                };
+
+                self.queue.complete(&request).await?;
+                self.metrics
+                    .record_build_completed(artifact.build_iterations);
+
+                Ok(Some(ProcessResult::Built {
+                    name: artifact.spec.name.clone(),
+                    oci_reference,
+                }))
+            }
+            PipelineOutcome::RecommendExtend { target, features } => {
+                self.queue.complete(&request).await?;
+                self.metrics.record_recommend_extend();
+                Ok(Some(ProcessResult::Extended { target, features }))
+            }
+            PipelineOutcome::Failed(e) => {
+                self.queue.fail(&request).await?;
+                self.metrics.record_build_failed();
+                Ok(Some(ProcessResult::Failed(e)))
+            }
+        }
+    }
+
+    pub async fn process_next_no_compile(
+        &self,
+    ) -> Result<Option<ProcessResult>, PipelineError> {
+        let request = match self.queue.claim_next().await? {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+
+        self.metrics.record_build_started();
+
+        let orchestrator = Orchestrator::new(self.llm.as_ref());
+        let outcome = orchestrator.run(&request).await;
+
+        match outcome {
+            PipelineOutcome::Built(artifact) => {
+                self.publisher.publish(&artifact).await?;
+                self.queue.complete(&request).await?;
+                self.metrics
+                    .record_build_completed(artifact.build_iterations);
+                Ok(Some(ProcessResult::Built {
+                    name: artifact.spec.name.clone(),
+                    oci_reference: None,
+                }))
+            }
+            PipelineOutcome::RecommendExtend { target, features } => {
+                self.queue.complete(&request).await?;
+                self.metrics.record_recommend_extend();
+                Ok(Some(ProcessResult::Extended { target, features }))
+            }
+            PipelineOutcome::Failed(e) => {
+                self.queue.fail(&request).await?;
+                self.metrics.record_build_failed();
+                Ok(Some(ProcessResult::Failed(e)))
+            }
+        }
+    }
+}
+
 fn dirs_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -278,5 +425,68 @@ mod tests {
 
         assert!(queue.list_pending().await.unwrap().is_empty());
         assert!(queue.list_in_progress().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn queue_consumer_processes_happy_path() {
+        use crate::cache::ToolCache;
+        use crate::llm::StubLlmClient;
+        use crate::metrics::PipelineMetrics;
+        use crate::publish::Publisher;
+        use std::sync::Arc;
+
+        let tmp = TempDir::new().unwrap();
+        let queue = Queue::new(tmp.path().join("queue"));
+        queue.init().await.unwrap();
+
+        let cache = ToolCache::new(tmp.path().join("tools"));
+        let publisher = Publisher::new(cache);
+        publisher.init().await.unwrap();
+
+        let architect_resp = serde_json::json!({
+            "action": "build",
+            "spec": {
+                "name": "test_tool",
+                "description": "A test tool",
+                "inputs": {"value": "string"},
+                "outputs": {"result": "string"},
+                "constraints": {"network": [], "storage": [], "secrets": []}
+            },
+            "design_notes": "Simple tool"
+        });
+        let engineer_resp = serde_json::json!({
+            "source_code": "fn main() {}",
+            "wit_definition": "package test:tool;",
+            "policy_yaml": "version: \"1.0\"",
+            "language": "rust"
+        });
+        let qa_resp = serde_json::json!({
+            "passed": true, "tests_run": 1, "tests_passed": 1,
+            "tests_failed": 0, "bug_tickets": []
+        });
+        let security_resp = serde_json::json!({
+            "passed": true, "exploits_attempted": 1,
+            "exploits_succeeded": 0, "bug_tickets": []
+        });
+
+        let llm = Arc::new(StubLlmClient::new(vec![
+            architect_resp.to_string(),
+            engineer_resp.to_string(),
+            qa_resp.to_string(),
+            security_resp.to_string(),
+        ]));
+
+        let metrics = Arc::new(PipelineMetrics::new());
+        let consumer = QueueConsumer::new(queue, llm, publisher, metrics.clone());
+
+        let request = make_request("test_tool");
+        consumer.queue().enqueue(&request).await.unwrap();
+
+        let result = consumer.process_next_no_compile().await.unwrap();
+        assert!(result.is_some());
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.builds_started, 1);
+        assert_eq!(snap.builds_completed, 1);
     }
 }

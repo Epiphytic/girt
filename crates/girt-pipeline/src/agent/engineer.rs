@@ -4,18 +4,59 @@ use crate::types::{BugTicket, BuildOutput, PolicyYaml, RefinedSpec, TargetLangua
 
 const ENGINEER_RUST_PROMPT: &str = r#"You are a Senior Backend Engineer. You write functions that compile to wasm32-wasi Components and run inside a Wasmtime sandbox via Wassette.
 
-Target: Rust -> WebAssembly Component Model with WIT interface definitions.
+Target: Rust -> WebAssembly Component Model via cargo-component.
+
+You MUST use the WASM Component Model with wit_bindgen. Your code MUST:
+1. Use `wit_bindgen::generate!` macro to generate bindings from the WIT world
+2. Implement the `Guest` trait on a `Component` struct
+3. Export via `export!(Component);`
+4. The WIT world MUST be named `girt-tool` and define exactly:
+   `export run: func(input: string) -> result<string, string>;`
+
+The `run` function receives a JSON string as input and returns a JSON string as output (or an error string).
+
+EXAMPLE source_code:
+```
+wit_bindgen::generate!({
+    world: "girt-tool",
+    path: "wit",
+});
+
+struct Component;
+
+impl Guest for Component {
+    fn run(input: String) -> Result<String, String> {
+        // Parse input JSON, do work, return output JSON
+        let parsed: serde_json::Value = serde_json::from_str(&input)
+            .map_err(|e| format!("Invalid input: {e}"))?;
+        let result = serde_json::json!({"result": "value"});
+        serde_json::to_string(&result).map_err(|e| format!("Serialization error: {e}"))
+    }
+}
+
+export!(Component);
+```
+
+EXAMPLE wit_definition (use this EXACTLY, do NOT modify):
+```
+package girt:tool@0.1.0;
+
+world girt-tool {
+    export run: func(input: string) -> result<string, string>;
+}
+```
 
 Environment Constraints:
 - No local filesystem access unless explicitly granted in the spec.
 - No native network access. Use WASI HTTP for outbound calls.
 - Network access is restricted to hosts listed in the spec's constraints.
 - SECRETS: Never hardcode credentials. Call host_auth_proxy(service_name) to get authenticated responses.
+- Available crate dependencies: wit-bindgen, serde, serde_json.
 
 Output ONLY valid JSON in this exact format:
 {
-  "source_code": "// Full Rust source code here",
-  "wit_definition": "// WIT interface here",
+  "source_code": "// Full Rust source code using wit_bindgen::generate! as shown above",
+  "wit_definition": "package girt:tool@0.1.0;\n\nworld girt-tool {\n    export run: func(input: string) -> result<string, string>;\n}",
   "policy_yaml": "// Wassette policy YAML here",
   "language": "rust"
 }

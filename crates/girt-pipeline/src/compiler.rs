@@ -2,6 +2,14 @@ use std::path::{Path, PathBuf};
 
 use crate::error::PipelineError;
 
+/// Default WIT definition for girt tools.
+const DEFAULT_WIT: &str = r#"package girt:tool;
+
+world girt-tool {
+    export run: func(input: string) -> result<string, string>;
+}
+"#;
+
 pub struct CompileInput {
     pub source_code: String,
     pub wit_definition: String,
@@ -68,11 +76,18 @@ path = "wit"
 
         std::fs::write(project_dir.join("src/lib.rs"), &input.source_code)?;
 
-        // Strip version suffix from WIT package line if present.
-        // cargo-component v0.21 does not support versioned package names.
-        let wit = input
-            .wit_definition
-            .replace("package girt:tool@0.1.0;", "package girt:tool;");
+        // Use the provided WIT or fall back to the standard girt-tool world.
+        let wit = if input.wit_definition.trim().is_empty()
+            || !input.wit_definition.contains("package")
+        {
+            DEFAULT_WIT.to_string()
+        } else {
+            // Strip version suffix from WIT package line if present.
+            // cargo-component v0.21 does not support versioned package names.
+            input
+                .wit_definition
+                .replace("package girt:tool@0.1.0;", "package girt:tool;")
+        };
         std::fs::write(project_dir.join("wit/world.wit"), wit)?;
 
         Ok(project_dir)

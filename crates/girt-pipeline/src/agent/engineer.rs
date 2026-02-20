@@ -209,7 +209,7 @@ impl<'a> EngineerAgent<'a> {
         }
 
         // If JSON extraction fails, generate a policy.yaml from the spec and
-        // treat the response as raw source code
+        // treat the response as raw source code with default WIT.
         let policy = PolicyYaml::from_spec(&spec.spec);
         let policy_yaml = serde_json::to_string_pretty(&policy).unwrap_or_default();
 
@@ -219,7 +219,7 @@ impl<'a> EngineerAgent<'a> {
         );
         Ok(BuildOutput {
             source_code: raw.to_string(),
-            wit_definition: String::new(),
+            wit_definition: "package girt:tool;\n\nworld girt-tool {\n    export run: func(input: string) -> result<string, string>;\n}\n".to_string(),
             policy_yaml,
             language: self.target.to_string(),
         })

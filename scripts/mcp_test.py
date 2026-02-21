@@ -32,29 +32,26 @@ def main():
         "name": "discord_approval",
         "description": (
             "Request human approval via a Discord channel. "
-            "On first call, posts the question and polls for a thumbs-up (approve) "
-            "or thumbs-down (deny) reaction for up to timeout_secs (max 60). "
-            "If no response arrives in time, returns status='pending' with the "
-            "message_id so the caller can re-invoke to continue polling — the WASM "
-            "does not loop indefinitely; re-invocation and overall deadline are the "
-            "caller's responsibility. "
-            "On re-invocation, pass message_id to skip posting and resume polling."
+            "Post a question and wait for a user to react with thumbs up (approve) "
+            "or thumbs down (deny). "
+            "Supports re-invocation with a message_id to continue polling "
+            "without re-posting the question."
         ),
         "inputs": {
-            "question": "string — the question to post; required (non-empty, non-whitespace) when message_id is absent; optional (ignored) when message_id is provided",
-            "context": "string — optional context shown below the question; posted verbatim, so callers should be aware it reaches human approvers",
-            "channel_id": "string — Discord channel snowflake: must match /^[0-9]{1,20}$/; reject anything else",
-            "guild_id": "string — Discord guild snowflake: must match /^[0-9]{1,20}$/; reject anything else",
-            "bot_token": "string — Discord bot token; used exclusively as 'Bot <token>' in the Authorization header; must never appear in URLs, query params, error messages, log output, or any output field; error messages on HTTP failure must use generic text only (e.g. 'Discord API error: <status_code>'), never raw request details",
-            "authorized_users": "array of strings — Discord usernames allowed to respond; deduplicate before use; empty means accept the first respondent",
-            "timeout_secs": "number — seconds to poll before returning pending; 10 to 60 inclusive; reject values outside this range",
-            "message_id": "string — optional; when provided, skip posting and resume polling this existing message; question becomes optional"
+            "question": "string — the question to ask",
+            "context": "string — optional additional context shown with the question",
+            "channel_id": "string — Discord channel ID",
+            "guild_id": "string — Discord guild ID (for the message permalink)",
+            "bot_token": "string — Discord bot token",
+            "authorized_users": "array of strings — usernames allowed to respond; empty means anyone",
+            "timeout_secs": "number — seconds to poll before returning pending",
+            "message_id": "string — optional; resume token from a previous invocation"
         },
         "outputs": {
-            "status": "string — 'approved', 'denied', or 'pending' (re-invoke with message_id to continue)",
-            "message_id": "string — Discord message ID; pass back on re-invocation",
-            "approved": "bool — true if approved, false if denied or pending",
-            "authorized_by": "string — Discord username of responder (empty if pending)",
+            "status": "string — approved, denied, or pending",
+            "message_id": "string — pass back on re-invocation to continue polling",
+            "approved": "bool",
+            "authorized_by": "string — Discord username of responder",
             "evidence_url": "string — permalink to the Discord message"
         },
         "constraints": {

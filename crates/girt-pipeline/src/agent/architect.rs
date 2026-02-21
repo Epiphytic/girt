@@ -36,6 +36,39 @@ Design Principles:
    - Set per-invocation timeout to ≤60 seconds. Backoff and overall deadline
      are the CALLER's responsibility — do not encode them in the tool.
 
+INPUT SPECIFICATION RULES — apply these mechanically to EVERY field:
+
+For EVERY input field, the spec description must state:
+  - The exact type (string | number | bool | array of X | optional string, etc.)
+  - For strings: maximum length AND either an exact regex or an allowed character set
+  - For numbers: minimum AND maximum, both followed by the word "(inclusive)"
+  - For arrays: maximum element count, element type, and deduplication policy
+    ("deduplicate before use" or "duplicates allowed")
+  - For optional fields: the EXACT behaviour when the field is absent AND the EXACT
+    behaviour when it is present (what is skipped, what becomes optional/required)
+
+For any field whose value is interpolated into a URL path or query string:
+  - Specify a strict allowlist regex (e.g. snowflake IDs: /^[0-9]{1,20}$/)
+  - State explicitly: "reject and return error for any value outside this pattern"
+  - Never allow user-supplied values into URLs without this rule being in the spec
+
+For any credential / token / API-key field:
+  - Name the exact HTTP header it goes into (e.g. "Authorization: Bot <token>")
+  - State: "strip CRLF from value before use in any header"
+  - State: "must never appear in error messages, output fields, URL paths, or log text"
+  - State: "HTTP errors must use generic text only — e.g. 'API error: <status_code>',
+    never raw request details or header values"
+
+For any resume token field (produced as output, accepted as optional input):
+  - Specify the same format validation as the underlying ID it references
+    (e.g. if it wraps a Discord message_id, apply the snowflake regex)
+  - State: "implementation must verify the referenced resource exists in the
+    expected channel before using it; return an error if it does not"
+
+For any field containing user-supplied text displayed to a third party:
+  - State a maximum length (characters)
+  - Note: "content is displayed verbatim; caller is responsible for what they put here"
+
 Output ONLY valid JSON in this exact format:
 {
   "action": "build",

@@ -32,6 +32,8 @@ pub struct GirtProxy {
     coding_standards: Option<String>,
     /// Circuit breaker iteration limit for the build loop.
     max_iterations: u32,
+    /// What to do when the iteration limit is reached with blocking tickets remaining.
+    circuit_breaker_policy: girt_pipeline::config::CircuitBreakerPolicy,
     /// Server peer for sending tools/list_changed notifications.
     server_peer: Arc<Mutex<Option<Peer<RoleServer>>>>,
 }
@@ -44,6 +46,7 @@ impl GirtProxy {
         runtime: Arc<LifecycleManager>,
         coding_standards: Option<String>,
         max_iterations: u32,
+        circuit_breaker_policy: girt_pipeline::config::CircuitBreakerPolicy,
     ) -> Self {
         Self {
             engine,
@@ -52,6 +55,7 @@ impl GirtProxy {
             runtime,
             coding_standards,
             max_iterations,
+            circuit_breaker_policy,
             server_peer: Arc::new(Mutex::new(None)),
         }
     }
@@ -416,7 +420,8 @@ impl GirtProxy {
 
         let orchestrator = Orchestrator::new(self.llm.as_ref())
             .with_standards(self.coding_standards.clone())
-            .with_max_iterations(self.max_iterations);
+            .with_max_iterations(self.max_iterations)
+            .with_circuit_breaker_policy(self.circuit_breaker_policy.clone());
         let outcome = orchestrator.run(&cap_request).await;
 
         match outcome {
@@ -491,6 +496,9 @@ impl GirtProxy {
                             "tests_passed": artifact.qa_result.tests_passed,
                             "exploits_attempted": artifact.security_result.exploits_attempted,
                             "exploits_succeeded": artifact.security_result.exploits_succeeded,
+                            "escalated": artifact.escalated,
+                            "escalated_tickets": artifact.escalated_tickets,
+                            "timings": artifact.timings,
                         });
                         Ok(make_tool_result(vec![Content::text(response.to_string())], false))
                     }

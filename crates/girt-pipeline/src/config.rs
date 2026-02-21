@@ -43,10 +43,30 @@ pub struct PipelineConfig {
     pub coding_standards_path: Option<String>,
 
     /// Maximum Engineer → QA/RedTeam iterations before the circuit breaker
-    /// triggers and the build is failed. Default: 3. Increase for complex
-    /// security-sensitive components that legitimately need more passes.
+    /// triggers. Default: 3.
     #[serde(default = "default_max_iterations")]
     pub max_iterations: u32,
+
+    /// What to do when the fix loop exhausts max_iterations with blocking
+    /// tickets remaining. Default: Ask.
+    #[serde(default)]
+    pub on_circuit_breaker: CircuitBreakerPolicy,
+}
+
+/// Policy for when the pipeline fix loop exhausts its iteration budget.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CircuitBreakerPolicy {
+    /// Escalate to a human for a decision.
+    /// Future: routes through the approval WASM.
+    /// Now: falls back to Proceed (fail open) with a warning.
+    #[default]
+    Ask,
+    /// Ship the build with remaining blocking tickets logged in the artifact.
+    /// Fail open — useful in bootstrap mode before an approval mechanism exists.
+    Proceed,
+    /// Abort with an error (original behaviour).
+    Fail,
 }
 
 fn default_max_iterations() -> u32 {
@@ -58,6 +78,7 @@ impl Default for PipelineConfig {
         Self {
             coding_standards_path: None,
             max_iterations: default_max_iterations(),
+            on_circuit_breaker: CircuitBreakerPolicy::default(),
         }
     }
 }

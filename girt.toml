@@ -34,7 +34,12 @@ coding_standards_path = "~/.openclaw/workspace/CLAUDE.md"
 
 # Maximum Engineer → QA/RedTeam iterations before the circuit breaker triggers.
 # Default: 3. Increase for complex security-sensitive components.
-max_iterations = 5
+max_iterations = 3
+# What to do when the fix loop exhausts max_iterations with blocking tickets remaining.
+# ask     = escalate to human for a decision (future: via approval WASM; now: falls back to proceed)
+# proceed = ship the build with remaining tickets logged in the artifact (fail open)
+# fail    = abort with an error (previous behaviour)
+on_circuit_breaker = "proceed"
 
 [registry]
 url = "ghcr.io/epiphytic/girt-tools"

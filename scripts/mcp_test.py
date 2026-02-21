@@ -131,6 +131,11 @@ def main():
                 print(f"  build_iterations : {parsed.get('build_iterations')}", flush=True)
                 print(f"  tests            : {parsed.get('tests_passed')}/{parsed.get('tests_run')}", flush=True)
                 print(f"  exploits blocked : {parsed.get('exploits_attempted')} attempted, {parsed.get('exploits_succeeded')} succeeded", flush=True)
+                if parsed.get("escalated"):
+                    tickets = parsed.get("escalated_tickets", [])
+                    print(f"  ⚠ ESCALATED: proceeded past circuit breaker with {len(tickets)} unresolved ticket(s):", flush=True)
+                    for t in tickets:
+                        print(f"    [{t.get('severity','?')}/{t.get('ticket_type','?')}] {t.get('actual','')}", flush=True)
                 t = parsed.get("timings", {})
                 if t:
                     def tok(u): return f"{u.get('input_tokens',0)}in/{u.get('output_tokens',0)}out" if u else "n/a"

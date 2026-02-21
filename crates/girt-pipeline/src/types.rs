@@ -269,6 +269,15 @@ pub struct BuildArtifact {
     pub build_iterations: u32,
     /// Per-stage timing breakdown for this pipeline run.
     pub timings: StageTimings,
+    /// True if the pipeline hit the iteration limit and proceeded past it
+    /// (on_circuit_breaker = "ask" or "proceed"). The build was shipped
+    /// despite remaining blocking tickets — see escalated_tickets.
+    #[serde(default)]
+    pub escalated: bool,
+    /// Blocking tickets that were unresolved when the pipeline was escalated.
+    /// Empty when escalated = false.
+    #[serde(default)]
+    pub escalated_tickets: Vec<BugTicket>,
 }
 
 /// Wassette policy.yaml content.

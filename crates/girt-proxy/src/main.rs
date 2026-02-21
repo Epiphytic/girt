@@ -148,7 +148,7 @@ async fn run_serve(config_flag: Option<PathBuf>) -> Result<()> {
     tracing::info!("girt-runtime initialized");
 
     // Create proxy handler
-    let proxy = GirtProxy::new(engine, llm, publisher, runtime, coding_standards, config.pipeline.max_iterations);
+    let proxy = GirtProxy::new(engine, llm, publisher, runtime, coding_standards, config.pipeline.max_iterations, config.pipeline.on_circuit_breaker);
 
     // Serve on stdio (agent connects here)
     let stdio = rmcp::transport::io::stdio();

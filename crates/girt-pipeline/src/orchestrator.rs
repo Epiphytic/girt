@@ -7,6 +7,7 @@ use crate::error::PipelineError;
 use crate::llm::LlmClient;
 use std::time::Instant;
 
+use crate::config::CircuitBreakerPolicy;
 use crate::llm::TokenUsage;
 use crate::types::{
     BugTicket, BugTicketSeverity, BuildArtifact, CapabilityRequest, ComplexityHint,
@@ -44,6 +45,8 @@ pub struct Orchestrator<'a> {
     coding_standards: Option<String>,
     /// Maximum Engineer → QA/RedTeam iterations before the circuit breaker fires.
     max_iterations: u32,
+    /// What to do when the iteration limit is reached with blocking tickets remaining.
+    circuit_breaker_policy: CircuitBreakerPolicy,
 }
 
 impl<'a> Orchestrator<'a> {
@@ -52,6 +55,7 @@ impl<'a> Orchestrator<'a> {
             llm,
             coding_standards: None,
             max_iterations: DEFAULT_MAX_ITERATIONS,
+            circuit_breaker_policy: CircuitBreakerPolicy::default(),
         }
     }
 
@@ -64,6 +68,12 @@ impl<'a> Orchestrator<'a> {
     /// Override the circuit breaker iteration limit.
     pub fn with_max_iterations(mut self, max_iterations: u32) -> Self {
         self.max_iterations = max_iterations;
+        self
+    }
+
+    /// Set the circuit breaker escalation policy.
+    pub fn with_circuit_breaker_policy(mut self, policy: CircuitBreakerPolicy) -> Self {
+        self.circuit_breaker_policy = policy;
         self
     }
 
@@ -239,24 +249,70 @@ impl<'a> Orchestrator<'a> {
                     security_result,
                     build_iterations: iteration,
                     timings,
+                    escalated: false,
+                    escalated_tickets: vec![],
                 }));
             }
 
-            // Circuit breaker fires only if blocking tickets remain
+            // Iteration limit reached with blocking tickets remaining
             if iteration >= self.max_iterations {
-                let summary = format_ticket_summary(&blocking);
                 timings.total_ms = pipeline_start.elapsed().as_millis() as u64;
-                tracing::error!(
-                    iteration,
-                    blocking = blocking.len(),
-                    advisory = advisory.len(),
-                    total_ms = timings.total_ms,
-                    "Circuit breaker: max iterations reached with blocking tickets"
-                );
-                return Err(PipelineError::CircuitBreaker {
-                    attempts: iteration,
-                    summary,
-                });
+                let remaining: Vec<BugTicket> = blocking.iter().map(|t| (*t).clone()).collect();
+                let summary = format_ticket_summary(&blocking);
+
+                match &self.circuit_breaker_policy {
+                    CircuitBreakerPolicy::Fail => {
+                        tracing::error!(
+                            iteration, blocking = blocking.len(),
+                            "Circuit breaker: failing pipeline (on_circuit_breaker=fail)"
+                        );
+                        return Err(PipelineError::CircuitBreaker {
+                            attempts: iteration,
+                            summary,
+                        });
+                    }
+                    CircuitBreakerPolicy::Ask => {
+                        // Future: route through approval WASM.
+                        // Now: fall through to Proceed with a warning.
+                        tracing::warn!(
+                            iteration, blocking = blocking.len(),
+                            "Circuit breaker: no approval mechanism configured, \
+                             failing open (on_circuit_breaker=ask, no WASM available)"
+                        );
+                        // fall through to Proceed
+                        tracing::warn!(summary, "Proceeding with unresolved blocking tickets");
+                        return Ok(Box::new(BuildArtifact {
+                            spec: spec.spec.clone(),
+                            refined_spec: spec.clone(),
+                            build_output,
+                            qa_result,
+                            security_result,
+                            build_iterations: iteration,
+                            timings,
+                            escalated: true,
+                            escalated_tickets: remaining,
+                        }));
+                    }
+                    CircuitBreakerPolicy::Proceed => {
+                        tracing::warn!(
+                            iteration, blocking = blocking.len(),
+                            "Circuit breaker: proceeding with unresolved tickets \
+                             (on_circuit_breaker=proceed)"
+                        );
+                        tracing::warn!(summary, "Unresolved blocking tickets");
+                        return Ok(Box::new(BuildArtifact {
+                            spec: spec.spec.clone(),
+                            refined_spec: spec.clone(),
+                            build_output,
+                            qa_result,
+                            security_result,
+                            build_iterations: iteration,
+                            timings,
+                            escalated: true,
+                            escalated_tickets: remaining,
+                        }));
+                    }
+                }
             }
 
             // Fix: pick the first BLOCKING ticket and send it back to engineer
@@ -642,7 +698,8 @@ mod tests {
             security_fail.to_string(),
         ]);
 
-        let orchestrator = Orchestrator::new(&client);
+        let orchestrator = Orchestrator::new(&client)
+            .with_circuit_breaker_policy(crate::config::CircuitBreakerPolicy::Fail);
         let spec = make_refined_spec();
 
         let outcome = orchestrator.run_from_spec(&spec).await;
@@ -652,6 +709,43 @@ mod tests {
                 assert!(!summary.is_empty());
             }
             other => panic!("Expected Failed(CircuitBreaker), got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_proceeds_when_policy_is_proceed() {
+        let engineer_resp = serde_json::json!({
+            "source_code": "fn main() {}",
+            "wit_definition": "package test:tool;",
+            "policy_yaml": "version: \"1.0\"",
+            "language": "rust"
+        });
+        let qa_fail = serde_json::json!({
+            "passed": false, "tests_run": 1, "tests_passed": 0, "tests_failed": 1,
+            "bug_tickets": [{"target":"engineer","ticket_type":"functional_defect",
+                "input":{},"expected":"ok","actual":"fail","remediation_directive":"fix it"}]
+        });
+        let security_ok = serde_json::json!({
+            "passed": true, "exploits_attempted": 0, "exploits_succeeded": 0, "bug_tickets": []
+        });
+        // 3 iterations: build + (qa_fail + security_ok + fix) × 3
+        let client = StubLlmClient::new(vec![
+            engineer_resp.to_string(),
+            qa_fail.to_string(), security_ok.to_string(), engineer_resp.to_string(),
+            qa_fail.to_string(), security_ok.to_string(), engineer_resp.to_string(),
+            qa_fail.to_string(), security_ok.to_string(),
+        ]);
+        let orchestrator = Orchestrator::new(&client)
+            .with_circuit_breaker_policy(crate::config::CircuitBreakerPolicy::Proceed);
+        let spec = make_refined_spec();
+
+        let outcome = orchestrator.run_from_spec(&spec).await;
+        match outcome {
+            PipelineOutcome::Built(artifact) => {
+                assert!(artifact.escalated);
+                assert!(!artifact.escalated_tickets.is_empty());
+            }
+            other => panic!("Expected Built (escalated), got {:?}", other),
         }
     }
 

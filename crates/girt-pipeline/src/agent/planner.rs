@@ -25,9 +25,24 @@ Think through each of the following areas carefully:
    - Note whether the credential needs sanitization before header use (e.g. strip CRLF)
 
    RESOURCE EXHAUSTION (timeouts, loops, payload sizes):
-   - For polling loops: state the maximum wall-clock time the component should run
-   - For timeout inputs: if the caller-supplied value seems high (>300s), flag it as a resource exhaustion risk and recommend a lower cap
    - For payload sizes: state max bytes to read from any single HTTP response
+
+5a. LONG-RUNNING OPERATIONS (continue-signal pattern — GIRT convention):
+   If the spec mentions waiting, polling, or any operation that could exceed 60 seconds
+   end-to-end (e.g. "wait for human approval", "poll until complete", "retry for 2 days",
+   "monitor until X happens"):
+   - The tool MUST use the continue-signal pattern. Do not plan a blocking loop.
+   - Identify the RESUME TOKEN: what state must survive across invocations?
+     (e.g. message_id, job_id, cursor, checkpoint_url). Name it explicitly.
+   - Plan two code paths:
+       First invocation: perform setup (post message, start job, etc.) then poll once
+       Re-invocation: receive resume token as optional input, skip setup, poll once
+   - Per-invocation poll budget: ≤60 seconds
+   - Fixed poll interval: 5–15 seconds (caller owns backoff/jitter — WASM never varies it)
+   - Maximum polls per invocation: budget ÷ interval (e.g. 60s / 10s = 6 polls)
+   - Output schema must include: status ("pending" | terminal values) + resume token
+   - Input schema must include: optional resume token field
+   - State clearly in api_sequence: what happens on first call vs re-invocation
 
 3. API SEQUENCE
    List every external call in order. For each:

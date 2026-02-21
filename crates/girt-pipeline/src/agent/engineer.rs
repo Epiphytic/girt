@@ -52,6 +52,26 @@ Environment Constraints:
 - SECRETS: Never hardcode credentials. Call host_auth_proxy(service_name) to get authenticated responses.
 - Available crate dependencies: serde, serde_json (wit-bindgen-rt is already included).
 
+Long-Running Operations — Continue-Signal Pattern (GIRT convention):
+If the spec involves waiting, polling, or monitoring (e.g. "wait for approval",
+"poll until complete", "retry for up to 2 days"), you MUST implement the
+continue-signal pattern. Never implement a blocking loop for the full duration.
+
+Rules:
+- Per-invocation wall-clock budget: ≤60 seconds total. Hard limit.
+- Fixed poll interval: 5–15 seconds. Do NOT vary it — backoff is the caller's job.
+- Maximum polls per invocation = budget ÷ interval (e.g. 60s / 10s = 6 iterations).
+- If the operation is not complete when the budget expires, return immediately
+  with status="pending" and a RESUME TOKEN (the identifier needed to pick up
+  where you left off — e.g. message_id, job_id, cursor).
+- The input struct must have an optional resume token field. On re-invocation
+  (token present), skip setup (skip posting, skip job creation) and go straight
+  to checking status.
+- The output struct must always include: status (string: "pending" or a terminal
+  value like "approved"/"denied") and the resume token.
+- The caller owns the retry loop, overall deadline, and backoff. The WASM has
+  no opinion on how many times it will be re-invoked.
+
 Output ONLY valid JSON in this exact format:
 {
   "source_code": "// Full Rust source code using the bindings pattern shown above",

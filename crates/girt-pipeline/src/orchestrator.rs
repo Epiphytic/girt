@@ -7,7 +7,7 @@ use crate::error::PipelineError;
 use crate::llm::LlmClient;
 use crate::types::{
     BugTicket, BuildArtifact, CapabilityRequest, ComplexityHint, ImplementationPlan, RefinedSpec,
-    SpecAction,
+    SpecAction, BugTicketSeverity,
 };
 
 /// Default maximum build-fix iterations. Override via `pipeline.max_iterations` in girt.toml.
@@ -149,14 +149,31 @@ impl<'a> Orchestrator<'a> {
             let qa_result = qa.test(spec, &build_output).await?;
             let security_result = red_team.audit(spec, &build_output).await?;
 
-            // Collect bug tickets from both
-            let mut tickets: Vec<BugTicket> = Vec::new();
-            tickets.extend(qa_result.bug_tickets.iter().cloned());
-            tickets.extend(security_result.bug_tickets.iter().cloned());
+            // Collect all bug tickets from both agents
+            let mut all_tickets: Vec<BugTicket> = Vec::new();
+            all_tickets.extend(qa_result.bug_tickets.iter().cloned());
+            all_tickets.extend(security_result.bug_tickets.iter().cloned());
 
-            // If both passed, we're done
-            if qa_result.passed && security_result.passed {
-                tracing::info!(iterations = iteration, "Pipeline passed all checks");
+            // Split into blocking (Critical/High) and advisory (Medium/Low)
+            let blocking: Vec<&BugTicket> =
+                all_tickets.iter().filter(|t| t.is_blocking()).collect();
+            let advisory: Vec<&BugTicket> =
+                all_tickets.iter().filter(|t| !t.is_blocking()).collect();
+
+            if !advisory.is_empty() {
+                tracing::info!(
+                    count = advisory.len(),
+                    "Advisory tickets (Medium/Low) — reported, not blocking"
+                );
+            }
+
+            // Pass when no blocking tickets remain (advisory tickets are fine)
+            if blocking.is_empty() {
+                tracing::info!(
+                    iterations = iteration,
+                    advisory = advisory.len(),
+                    "Pipeline passed all critical/high checks"
+                );
                 return Ok(Box::new(BuildArtifact {
                     spec: spec.spec.clone(),
                     refined_spec: spec.clone(),
@@ -167,13 +184,14 @@ impl<'a> Orchestrator<'a> {
                 }));
             }
 
-            // Circuit breaker
+            // Circuit breaker fires only if blocking tickets remain
             if iteration >= self.max_iterations {
-                let summary = format_ticket_summary(&tickets);
+                let summary = format_ticket_summary(&blocking);
                 tracing::error!(
                     iteration,
-                    tickets = tickets.len(),
-                    "Circuit breaker: max iterations reached"
+                    blocking = blocking.len(),
+                    advisory = advisory.len(),
+                    "Circuit breaker: max iterations reached with blocking tickets"
                 );
                 return Err(PipelineError::CircuitBreaker {
                     attempts: iteration,
@@ -181,10 +199,11 @@ impl<'a> Orchestrator<'a> {
                 });
             }
 
-            // Fix: pick the first ticket and send it back to engineer
-            if let Some(ticket) = tickets.first() {
+            // Fix: pick the first BLOCKING ticket and send it back to engineer
+            if let Some(ticket) = blocking.first() {
                 tracing::info!(
                     iteration,
+                    severity = ?ticket.severity,
                     ticket_type = ?ticket.ticket_type,
                     "Sending fix directive to engineer"
                 );
@@ -260,14 +279,15 @@ fn needs_planner(spec: &RefinedSpec) -> bool {
     false
 }
 
-fn format_ticket_summary(tickets: &[BugTicket]) -> String {
+fn format_ticket_summary(tickets: &[&BugTicket]) -> String {
     tickets
         .iter()
         .enumerate()
         .map(|(i, t)| {
             format!(
-                "#{}: [{:?}] expected: {}, actual: {}",
+                "#{}: [{:?}/{:?}] expected: {}, actual: {}",
                 i + 1,
+                t.severity,
                 t.ticket_type,
                 t.expected,
                 t.actual

@@ -9,10 +9,31 @@ Your Mission: Attempt to find security vulnerabilities in the component.
 Attack vectors to evaluate:
 - SSRF: URL-handling logic hitting disallowed hosts (cloud metadata, localhost)
 - Path traversal: ../../../etc/shadow or equivalent
-- Prompt injection: If the tool processes text, can instructions subvert behavior?
+- Header/CRLF injection: newlines in string inputs reaching HTTP headers
+- Credential leakage: tokens/keys appearing in error messages, URLs, or output fields
 - Permission escalation: Access to storage/network/env beyond policy.yaml
-- Resource exhaustion: Unbounded memory or CPU from crafted inputs
+- Resource exhaustion: Unbounded memory, CPU, or HTTP calls from crafted inputs
 - Data exfiltration: Leaking input data through allowed channels
+- Input validation bypass: Inputs outside spec bounds that are accepted without error
+- Prompt injection: If the tool processes text, can instructions subvert automated pipelines?
+
+For each finding, assign a severity tier:
+  critical — Directly and reliably exploitable in production; immediate risk of data
+             breach, credential theft, or system compromise. Requires an active fix.
+             Examples: CRLF injection into real HTTP headers, auth bypass, RCE.
+  high     — Clear exploit path under specific but realistic conditions.
+             Examples: path traversal accepted, token visible in error output,
+             missing validation on a security-critical field (snowflake ID in URL).
+  medium   — Requires attacker control of multiple parameters, or impact is limited
+             by other mitigations already in place (e.g. NetworkPolicy blocks SSRF).
+             Examples: social engineering via user-controlled display content,
+             phishing text in a field that reaches human approvers.
+  low      — Theoretical risk, hard to exploit in practice, or fully mitigated
+             by the runtime sandbox. Report it, but do not require a fix.
+             Examples: verbose error text, minor information disclosure.
+
+PASS CRITERIA: passed=true when there are no critical or high findings.
+Medium and low findings are informational — they do not block the build.
 
 Output ONLY valid JSON:
 {
@@ -23,6 +44,7 @@ Output ONLY valid JSON:
     {
       "target": "engineer",
       "ticket_type": "security_vulnerability",
+      "severity": "critical|high|medium|low",
       "input": <the exploit input>,
       "expected": "what should be blocked",
       "actual": "what actually happened",
@@ -111,6 +133,7 @@ impl<'a> RedTeamAgent<'a> {
             bug_tickets: vec![BugTicket {
                 target: "engineer".into(),
                 ticket_type: BugTicketType::SecurityVulnerability,
+                severity: crate::types::BugTicketSeverity::High,
                 input: serde_json::json!({"exploit": "payload"}),
                 expected: "request should be blocked".into(),
                 actual: "request succeeded".into(),

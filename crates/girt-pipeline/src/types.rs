@@ -138,10 +138,23 @@ pub struct BuildOutput {
 pub struct BugTicket {
     pub target: String,
     pub ticket_type: BugTicketType,
+    /// Severity tier. Defaults to High when not specified (safe default).
+    #[serde(default)]
+    pub severity: BugTicketSeverity,
     pub input: serde_json::Value,
     pub expected: String,
     pub actual: String,
     pub remediation_directive: String,
+}
+
+impl BugTicket {
+    /// A ticket is blocking (triggers a fix loop) if severity is Critical or High.
+    pub fn is_blocking(&self) -> bool {
+        matches!(
+            self.severity,
+            BugTicketSeverity::Critical | BugTicketSeverity::High
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,6 +162,20 @@ pub struct BugTicket {
 pub enum BugTicketType {
     FunctionalDefect,
     SecurityVulnerability,
+}
+
+/// Severity tier for bug tickets.
+///
+/// Critical and High tickets block the build and trigger Engineer fix loops.
+/// Medium and Low tickets are reported in the artifact but do not block.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BugTicketSeverity {
+    Critical,
+    #[default]
+    High,
+    Medium,
+    Low,
 }
 
 /// QA test results.

@@ -10,6 +10,19 @@ Generate test cases covering:
 1. Standard use cases (happy path)
 2. Edge cases (empty inputs, boundary values, unicode)
 3. Malformed inputs (wrong types, missing fields, oversized payloads)
+4. Spec contract violations (inputs outside stated bounds, missing required fields)
+
+For each failing test, assign a severity:
+  critical — Input accepted that the spec explicitly forbids AND has security implications
+             (e.g. rejected format bypassed, credential leaked)
+  high     — Significant defect that breaks a correctness guarantee from the spec
+             (e.g. required validation missing, wrong output on valid input)
+  medium   — Edge case or inefficiency unlikely to cause harm in production
+             (e.g. duplicate work, suboptimal error message, unnecessary allocations)
+  low      — Minor inconsistency or best-practice gap with negligible impact
+
+PASS CRITERIA: passed=true when there are no critical or high tickets.
+Medium and low tickets are informational — they do not block the build.
 
 Output ONLY valid JSON:
 {
@@ -21,6 +34,7 @@ Output ONLY valid JSON:
     {
       "target": "engineer",
       "ticket_type": "functional_defect",
+      "severity": "critical|high|medium|low",
       "input": <the failing input>,
       "expected": "what should happen",
       "actual": "what actually happened",
@@ -114,6 +128,7 @@ impl<'a> QaAgent<'a> {
             bug_tickets: vec![BugTicket {
                 target: "engineer".into(),
                 ticket_type: BugTicketType::FunctionalDefect,
+                severity: crate::types::BugTicketSeverity::High,
                 input: serde_json::json!({"test": "failing_input"}),
                 expected: "correct output".into(),
                 actual: "incorrect output".into(),

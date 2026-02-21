@@ -57,6 +57,24 @@ impl LlmEvaluator for StubLlmEvaluator {
     }
 }
 
+/// An LLM evaluator that always returns ALLOW. Used for the Creation Gate
+/// in `policy_only` mode (bootstrap builds where no approval WASM exists yet).
+pub struct AllowAllLlmEvaluator;
+
+impl LlmEvaluator for AllowAllLlmEvaluator {
+    fn evaluate<'a>(
+        &'a self,
+        _input: &'a GateInput,
+    ) -> Pin<Box<dyn Future<Output = Result<LlmDecision, DecisionError>> + Send + 'a>> {
+        Box::pin(async move {
+            Ok(LlmDecision {
+                decision: LlmDecisionKind::Allow,
+                rationale: "policy_only mode — LLM gate bypassed for bootstrap".into(),
+            })
+        })
+    }
+}
+
 impl LlmEvaluationLayer {
     pub fn new(evaluator: Box<dyn LlmEvaluator>) -> Self {
         Self { evaluator }
@@ -65,6 +83,13 @@ impl LlmEvaluationLayer {
     pub fn with_stub() -> Self {
         Self {
             evaluator: Box::new(StubLlmEvaluator),
+        }
+    }
+
+    /// Always-allow evaluator for bootstrap/policy-only mode.
+    pub fn with_allow_all() -> Self {
+        Self {
+            evaluator: Box::new(AllowAllLlmEvaluator),
         }
     }
 }

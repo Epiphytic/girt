@@ -115,12 +115,22 @@ async fn run_serve(config_flag: Option<PathBuf>) -> Result<()> {
     // Load optional coding standards (injected into Engineer's system prompt)
     let coding_standards = config.load_coding_standards();
 
-    // Initialize the Hookwise decision engine with real LLM evaluators.
-    // Both gates share the same underlying client via Arc.
-    let engine = Arc::new(DecisionEngine::with_real_llm(
-        Box::new(GateLlmEvaluator::new(Arc::clone(&llm))),
-        Box::new(GateLlmEvaluator::new(Arc::clone(&llm))),
-    ));
+    // Initialize the Hookwise decision engine.
+    let engine = Arc::new(match config.security.creation_gate.as_str() {
+        "policy_only" => {
+            tracing::warn!(
+                "Creation Gate in POLICY-ONLY mode — LLM/HITL approval bypassed. \
+                 Bootstrap use only. Switch back to 'llm' after the approval WASM is built."
+            );
+            DecisionEngine::with_policy_only_creation(Box::new(GateLlmEvaluator::new(
+                Arc::clone(&llm),
+            )))
+        }
+        _ => DecisionEngine::with_real_llm(
+            Box::new(GateLlmEvaluator::new(Arc::clone(&llm))),
+            Box::new(GateLlmEvaluator::new(Arc::clone(&llm))),
+        ),
+    });
     tracing::info!("Decision engine initialized with real LLM evaluator");
 
     // Initialize tool cache and publisher
@@ -138,7 +148,7 @@ async fn run_serve(config_flag: Option<PathBuf>) -> Result<()> {
     tracing::info!("girt-runtime initialized");
 
     // Create proxy handler
-    let proxy = GirtProxy::new(engine, llm, publisher, runtime, coding_standards);
+    let proxy = GirtProxy::new(engine, llm, publisher, runtime, coding_standards, config.pipeline.max_iterations);
 
     // Serve on stdio (agent connects here)
     let stdio = rmcp::transport::io::stdio();

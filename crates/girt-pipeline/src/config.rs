@@ -15,15 +15,51 @@ pub struct GirtConfig {
     pub build: BuildConfig,
     #[serde(default)]
     pub pipeline: PipelineConfig,
+    #[serde(default)]
+    pub security: SecurityConfig,
+}
+
+/// Security and gate configuration.
+#[derive(Debug, Default, Deserialize)]
+pub struct SecurityConfig {
+    /// Controls Creation Gate evaluation mode:
+    /// - `"llm"` (default): full LLM + HITL approval required
+    /// - `"policy_only"`: policy rules enforced, LLM/HITL bypassed
+    ///   **Use only for bootstrapping** — switch back to "llm" after.
+    #[serde(default = "default_creation_gate")]
+    pub creation_gate: String,
+}
+
+fn default_creation_gate() -> String {
+    "llm".into()
 }
 
 /// Pipeline-level configuration.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct PipelineConfig {
     /// Path to a coding standards file (e.g. ~/.claude/CLAUDE.md).
     /// When set, the contents are injected into the Engineer's system prompt
     /// so generated code follows your project's conventions.
     pub coding_standards_path: Option<String>,
+
+    /// Maximum Engineer → QA/RedTeam iterations before the circuit breaker
+    /// triggers and the build is failed. Default: 3. Increase for complex
+    /// security-sensitive components that legitimately need more passes.
+    #[serde(default = "default_max_iterations")]
+    pub max_iterations: u32,
+}
+
+fn default_max_iterations() -> u32 {
+    3
+}
+
+impl Default for PipelineConfig {
+    fn default() -> Self {
+        Self {
+            coding_standards_path: None,
+            max_iterations: default_max_iterations(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]

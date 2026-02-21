@@ -6,8 +6,8 @@ use crate::error::PipelineError;
 use crate::llm::LlmClient;
 use crate::types::{BugTicket, BuildArtifact, CapabilityRequest, RefinedSpec, SpecAction};
 
-/// Maximum number of build-fix iterations before circuit breaker triggers.
-const MAX_ITERATIONS: u32 = 3;
+/// Default maximum build-fix iterations. Override via `pipeline.max_iterations` in girt.toml.
+const DEFAULT_MAX_ITERATIONS: u32 = 3;
 
 /// Result of a single pipeline run.
 #[derive(Debug)]
@@ -35,6 +35,8 @@ pub struct Orchestrator<'a> {
     llm: &'a dyn LlmClient,
     /// Optional coding standards to inject into the Engineer's system prompt.
     coding_standards: Option<String>,
+    /// Maximum Engineer → QA/RedTeam iterations before the circuit breaker fires.
+    max_iterations: u32,
 }
 
 impl<'a> Orchestrator<'a> {
@@ -42,12 +44,19 @@ impl<'a> Orchestrator<'a> {
         Self {
             llm,
             coding_standards: None,
+            max_iterations: DEFAULT_MAX_ITERATIONS,
         }
     }
 
     /// Attach coding standards to be passed to the Engineer agent.
     pub fn with_standards(mut self, standards: Option<String>) -> Self {
         self.coding_standards = standards;
+        self
+    }
+
+    /// Override the circuit breaker iteration limit.
+    pub fn with_max_iterations(mut self, max_iterations: u32) -> Self {
+        self.max_iterations = max_iterations;
         self
     }
 
@@ -122,7 +131,7 @@ impl<'a> Orchestrator<'a> {
             }
 
             // Circuit breaker
-            if iteration >= MAX_ITERATIONS {
+            if iteration >= self.max_iterations {
                 let summary = format_ticket_summary(&tickets);
                 tracing::error!(
                     iteration,

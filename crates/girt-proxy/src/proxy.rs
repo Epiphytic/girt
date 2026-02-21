@@ -30,6 +30,8 @@ pub struct GirtProxy {
     runtime: Arc<LifecycleManager>,
     /// Coding standards injected into the Engineer's system prompt.
     coding_standards: Option<String>,
+    /// Circuit breaker iteration limit for the build loop.
+    max_iterations: u32,
     /// Server peer for sending tools/list_changed notifications.
     server_peer: Arc<Mutex<Option<Peer<RoleServer>>>>,
 }
@@ -41,6 +43,7 @@ impl GirtProxy {
         publisher: Arc<Publisher>,
         runtime: Arc<LifecycleManager>,
         coding_standards: Option<String>,
+        max_iterations: u32,
     ) -> Self {
         Self {
             engine,
@@ -48,6 +51,7 @@ impl GirtProxy {
             publisher,
             runtime,
             coding_standards,
+            max_iterations,
             server_peer: Arc::new(Mutex::new(None)),
         }
     }
@@ -411,7 +415,8 @@ impl GirtProxy {
         );
 
         let orchestrator = Orchestrator::new(self.llm.as_ref())
-            .with_standards(self.coding_standards.clone());
+            .with_standards(self.coding_standards.clone())
+            .with_max_iterations(self.max_iterations);
         let outcome = orchestrator.run(&cap_request).await;
 
         match outcome {

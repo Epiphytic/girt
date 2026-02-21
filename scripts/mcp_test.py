@@ -26,14 +26,36 @@ def recv(timeout=30):
     return json.loads(raw.decode().strip())
 
 def main():
+    # This is what a calling agent would actually write — high-level intent only.
+    # The Architect decides implementation details, security requirements, API choices.
     spec = {
-        "name": "add_two_numbers",
+        "name": "discord_approval",
         "description": (
-            "Add two numbers. Takes JSON with 'a' and 'b' (numbers), "
-            "returns JSON with 'result' (number). Pure arithmetic, no I/O."
+            "Request human approval by posting a question to a Discord channel. "
+            "Wait for an authorized user to react with a thumbs up (approve) or "
+            "thumbs down (deny), or reply with a message. "
+            "Return whether it was approved, who responded, and a link to the message."
         ),
-        "inputs": {"a": "number", "b": "number"},
-        "outputs": {"result": "number"},
+        "inputs": {
+            "question": "string — the question to ask the approver",
+            "context": "string — additional context for the approver",
+            "channel_id": "string — Discord channel to post to",
+            "guild_id": "string — Discord guild (for the message permalink)",
+            "bot_token": "string — Discord bot token",
+            "authorized_users": "array of strings — usernames who may respond (empty = anyone)",
+            "timeout_secs": "number — seconds to wait before auto-deny"
+        },
+        "outputs": {
+            "approved": "bool",
+            "user_message": "string — text reply from approver, if any",
+            "authorized_by": "string — Discord username of responder",
+            "evidence_url": "string — permalink to the Discord message"
+        },
+        "constraints": {
+            "network": ["discord.com"],
+            "storage": [],
+            "secrets": []
+        }
     }
 
     print(f"[bel] Starting girt: {GIRT_BIN}", flush=True)

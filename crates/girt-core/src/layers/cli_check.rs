@@ -57,7 +57,8 @@ impl DecisionLayer for CliCheckLayer {
             for utility in &self.known_utilities {
                 let matched = utility.keywords.iter().any(|kw| {
                     let kw_lower = kw.to_lowercase();
-                    name_lower.contains(&kw_lower) || desc_lower.contains(&kw_lower)
+                    contains_word(&name_lower, &kw_lower)
+                        || contains_word(&desc_lower, &kw_lower)
                 });
 
                 if matched {
@@ -77,6 +78,35 @@ impl DecisionLayer for CliCheckLayer {
             Ok(None)
         })
     }
+}
+
+/// Check whether `text` contains `word` as a whole word (bounded by
+/// non-alphanumeric characters or string start/end).
+///
+/// This prevents short keywords like "sed" matching inside words like
+/// "elapsed" or "described".
+fn contains_word(text: &str, word: &str) -> bool {
+    let mut start = 0;
+    while let Some(pos) = text[start..].find(word) {
+        let abs = start + pos;
+        let before_ok = abs == 0
+            || !text[..abs]
+                .chars()
+                .next_back()
+                .map(|c| c.is_alphanumeric() || c == '_')
+                .unwrap_or(false);
+        let after_ok = abs + word.len() >= text.len()
+            || !text[abs + word.len()..]
+                .chars()
+                .next()
+                .map(|c| c.is_alphanumeric() || c == '_')
+                .unwrap_or(false);
+        if before_ok && after_ok {
+            return true;
+        }
+        start = abs + 1;
+    }
+    false
 }
 
 fn default_utilities() -> Vec<CliUtility> {
@@ -164,6 +194,40 @@ mod tests {
 
         let result = layer.evaluate(&input).await.unwrap();
         assert!(result.is_none());
+    }
+
+    /// "elapsed" contains the substring "sed" but is NOT a whole-word match.
+    /// A Discord bot using "elapsed time" in its description should not be
+    /// deferred to sed.
+    #[tokio::test]
+    async fn elapsed_does_not_match_sed() {
+        let layer = CliCheckLayer::with_defaults();
+        let input = make_spec(
+            "discord_approval",
+            "Post an approval request to Discord. Uses wasi:clocks/wall-clock \
+             to track elapsed time for polling.",
+        );
+        let result = layer.evaluate(&input).await.unwrap();
+        assert!(
+            result.is_none(),
+            "discord_approval should not be deferred to sed via 'elapsed'"
+        );
+    }
+
+    #[test]
+    fn contains_word_whole_word_match() {
+        assert!(contains_word("use sed to edit", "sed"));
+        assert!(contains_word("sed filter", "sed"));
+        assert!(contains_word("run sed", "sed"));
+        assert!(contains_word("sed", "sed"));
+    }
+
+    #[test]
+    fn contains_word_no_partial_match() {
+        assert!(!contains_word("elapsed time", "sed"));
+        assert!(!contains_word("described above", "sed"));
+        assert!(!contains_word("discord", "sed"));
+        assert!(!contains_word("messages", "sed"));
     }
 
     #[tokio::test]

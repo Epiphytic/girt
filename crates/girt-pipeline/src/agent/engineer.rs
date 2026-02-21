@@ -132,6 +132,8 @@ pub struct EngineerAgent<'a> {
     /// Optional coding standards injected into every system prompt.
     /// Loaded from `pipeline.coding_standards_path` in girt.toml.
     coding_standards: Option<String>,
+    /// Token budget for LLM responses. Complex WASM components need 8000+.
+    max_tokens: u32,
 }
 
 impl<'a> EngineerAgent<'a> {
@@ -140,6 +142,7 @@ impl<'a> EngineerAgent<'a> {
             llm,
             target: TargetLanguage::default(),
             coding_standards: None,
+            max_tokens: 64000,
         }
     }
 
@@ -148,12 +151,19 @@ impl<'a> EngineerAgent<'a> {
             llm,
             target,
             coding_standards: None,
+            max_tokens: 64000,
         }
     }
 
     /// Attach coding standards to be injected into the system prompt.
     pub fn with_standards(mut self, standards: Option<String>) -> Self {
         self.coding_standards = standards;
+        self
+    }
+
+    /// Override the token budget (default: 8192).
+    pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
+        self.max_tokens = max_tokens;
         self
     }
 
@@ -198,7 +208,7 @@ impl<'a> EngineerAgent<'a> {
                 role: "user".into(),
                 content: format!("Implement this tool spec as a WASM Component:\n\n{spec_json}"),
             }],
-            max_tokens: 4000,
+            max_tokens: self.max_tokens,
         };
 
         let response = self.llm.chat(&request).await?;
@@ -226,7 +236,7 @@ impl<'a> EngineerAgent<'a> {
                     ticket_json,
                 ),
             }],
-            max_tokens: 4000,
+            max_tokens: self.max_tokens,
         };
 
         let response = self.llm.chat(&request).await?;

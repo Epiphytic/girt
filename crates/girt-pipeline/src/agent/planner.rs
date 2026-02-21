@@ -107,7 +107,7 @@ impl<'a> PlannerAgent<'a> {
                     "Produce an implementation plan for this tool spec:\n\n{spec_json}"
                 ),
             }],
-            max_tokens: 4000,
+            max_tokens: 32_000,
         };
 
         let response = self.llm.chat(&request).await?;

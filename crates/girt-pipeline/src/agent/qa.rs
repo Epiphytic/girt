@@ -59,7 +59,7 @@ impl<'a> QaAgent<'a> {
                     build.policy_yaml,
                 ),
             }],
-            max_tokens: 2000,
+            max_tokens: 16_000,
         };
 
         let response = self.llm.chat(&request).await?;

@@ -60,7 +60,7 @@ impl<'a> RedTeamAgent<'a> {
                     serde_json::to_string_pretty(&spec.spec).unwrap_or_default(),
                 ),
             }],
-            max_tokens: 2000,
+            max_tokens: 16_000,
         };
 
         let response = self.llm.chat(&request).await?;

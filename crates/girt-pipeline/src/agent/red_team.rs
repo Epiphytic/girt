@@ -1,5 +1,5 @@
 use crate::error::PipelineError;
-use crate::llm::{LlmClient, LlmMessage, LlmRequest};
+use crate::llm::{LlmClient, LlmMessage, LlmRequest, TokenUsage};
 use crate::types::{BugTicket, BugTicketType, BuildOutput, RefinedSpec, SecurityResult};
 
 const RED_TEAM_SYSTEM_PROMPT: &str = r#"You are an Offensive Security Researcher. You are given a WASM component's source code and its policy.yaml (declared permissions).
@@ -70,7 +70,7 @@ impl<'a> RedTeamAgent<'a> {
         &self,
         spec: &RefinedSpec,
         build: &BuildOutput,
-    ) -> Result<SecurityResult, PipelineError> {
+    ) -> Result<(SecurityResult, TokenUsage), PipelineError> {
         let request = LlmRequest {
             system_prompt: RED_TEAM_SYSTEM_PROMPT.into(),
             messages: vec![LlmMessage {
@@ -86,6 +86,7 @@ impl<'a> RedTeamAgent<'a> {
         };
 
         let response = self.llm.chat(&request).await?;
+        let usage = response.usage.clone();
 
         let result: SecurityResult = match super::extract_json(&response.content) {
             Some(r) => r,
@@ -106,12 +107,13 @@ impl<'a> RedTeamAgent<'a> {
         tracing::info!(
             passed = result.passed,
             exploits_attempted = result.exploits_attempted,
-            exploits_succeeded = result.exploits_succeeded,
             bug_tickets = result.bug_tickets.len(),
+            input_tokens = usage.input_tokens,
+            output_tokens = usage.output_tokens,
             "Red Team audit complete"
         );
 
-        Ok(result)
+        Ok((result, usage))
     }
 
     /// Create a passing security result for testing.
@@ -187,7 +189,7 @@ mod tests {
         let agent = RedTeamAgent::new(&client);
         let (spec, build) = make_test_context();
 
-        let result = agent.audit(&spec, &build).await.unwrap();
+        let (result, _) = agent.audit(&spec, &build).await.unwrap();
         assert!(result.passed);
         assert_eq!(result.exploits_succeeded, 0);
         assert!(result.bug_tickets.is_empty());
@@ -213,7 +215,7 @@ mod tests {
         let agent = RedTeamAgent::new(&client);
         let (spec, build) = make_test_context();
 
-        let result = agent.audit(&spec, &build).await.unwrap();
+        let (result, _) = agent.audit(&spec, &build).await.unwrap();
         assert!(!result.passed);
         assert_eq!(result.exploits_succeeded, 1);
         assert_eq!(result.bug_tickets.len(), 1);

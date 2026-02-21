@@ -1,7 +1,7 @@
 use girt_core::spec::CapabilitySpec;
 
 use crate::error::PipelineError;
-use crate::llm::{LlmClient, LlmMessage, LlmRequest};
+use crate::llm::{LlmClient, LlmMessage, LlmRequest, TokenUsage};
 use crate::types::{RefinedSpec, SpecAction};
 
 const ARCHITECT_SYSTEM_PROMPT: &str = r#"You are a Chief Software Architect specializing in tool design for sandboxed WebAssembly environments. You do not write implementation code.
@@ -102,7 +102,7 @@ impl<'a> ArchitectAgent<'a> {
         Self { llm }
     }
 
-    pub async fn refine(&self, spec: &CapabilitySpec) -> Result<RefinedSpec, PipelineError> {
+    pub async fn refine(&self, spec: &CapabilitySpec) -> Result<(RefinedSpec, TokenUsage), PipelineError> {
         let spec_json = serde_json::to_string_pretty(spec)
             .map_err(|e| PipelineError::LlmError(format!("Failed to serialize spec: {e}")))?;
 
@@ -118,6 +118,7 @@ impl<'a> ArchitectAgent<'a> {
         };
 
         let response = self.llm.chat(&request).await?;
+        let usage = response.usage.clone();
 
         // Parse the JSON response (handles code fences and surrounding text)
         let refined: RefinedSpec = super::extract_json(&response.content).ok_or_else(|| {
@@ -134,10 +135,12 @@ impl<'a> ArchitectAgent<'a> {
         tracing::info!(
             action = ?refined.action,
             name = %refined.spec.name,
+            input_tokens = usage.input_tokens,
+            output_tokens = usage.output_tokens,
             "Architect refined spec"
         );
 
-        Ok(refined)
+        Ok((refined, usage))
     }
 
     /// Fallback: if the Architect LLM call fails, pass through the original spec unrefined.
@@ -195,7 +198,7 @@ mod tests {
         let agent = ArchitectAgent::new(&client);
         let spec = make_spec();
 
-        let refined = agent.refine(&spec).await.unwrap();
+        let (refined, _usage) = agent.refine(&spec).await.unwrap();
         assert_eq!(refined.action, SpecAction::Build);
         assert_eq!(refined.spec.name, "github_issues");
         assert!(!refined.design_notes.is_empty());

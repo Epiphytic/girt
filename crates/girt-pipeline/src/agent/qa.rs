@@ -1,5 +1,5 @@
 use crate::error::PipelineError;
-use crate::llm::{LlmClient, LlmMessage, LlmRequest};
+use crate::llm::{LlmClient, LlmMessage, LlmRequest, TokenUsage};
 use crate::types::{BugTicket, BugTicketType, BuildOutput, QaResult, RefinedSpec};
 
 const QA_SYSTEM_PROMPT: &str = r#"You are a QA Automation Engineer. You are given a tool specification and its implementation.
@@ -60,7 +60,7 @@ impl<'a> QaAgent<'a> {
         &self,
         spec: &RefinedSpec,
         build: &BuildOutput,
-    ) -> Result<QaResult, PipelineError> {
+    ) -> Result<(QaResult, TokenUsage), PipelineError> {
         let request = LlmRequest {
             system_prompt: QA_SYSTEM_PROMPT.into(),
             messages: vec![LlmMessage {
@@ -77,6 +77,7 @@ impl<'a> QaAgent<'a> {
         };
 
         let response = self.llm.chat(&request).await?;
+        let usage = response.usage.clone();
 
         let result: QaResult = match super::extract_json(&response.content) {
             Some(r) => r,
@@ -98,13 +99,13 @@ impl<'a> QaAgent<'a> {
         tracing::info!(
             passed = result.passed,
             tests_run = result.tests_run,
-            tests_passed = result.tests_passed,
-            tests_failed = result.tests_failed,
             bug_tickets = result.bug_tickets.len(),
+            input_tokens = usage.input_tokens,
+            output_tokens = usage.output_tokens,
             "QA testing complete"
         );
 
-        Ok(result)
+        Ok((result, usage))
     }
 
     /// Create a passing QA result for testing.
@@ -183,7 +184,7 @@ mod tests {
         let agent = QaAgent::new(&client);
         let (spec, build) = make_test_context();
 
-        let result = agent.test(&spec, &build).await.unwrap();
+        let (result, _) = agent.test(&spec, &build).await.unwrap();
         assert!(result.passed);
         assert_eq!(result.tests_run, 5);
         assert!(result.bug_tickets.is_empty());
@@ -210,7 +211,7 @@ mod tests {
         let agent = QaAgent::new(&client);
         let (spec, build) = make_test_context();
 
-        let result = agent.test(&spec, &build).await.unwrap();
+        let (result, _) = agent.test(&spec, &build).await.unwrap();
         assert!(!result.passed);
         assert_eq!(result.bug_tickets.len(), 1);
         assert_eq!(

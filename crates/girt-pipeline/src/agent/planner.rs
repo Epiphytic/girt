@@ -1,5 +1,5 @@
 use crate::error::PipelineError;
-use crate::llm::{LlmClient, LlmMessage, LlmRequest};
+use crate::llm::{LlmClient, LlmMessage, LlmRequest, TokenUsage};
 use crate::types::{ImplementationPlan, RefinedSpec};
 
 const PLANNER_SYSTEM_PROMPT: &str = r#"You are a Senior Security Architect and Implementation Planner for sandboxed WebAssembly components. You do not write code. You produce implementation plans.
@@ -95,7 +95,7 @@ impl<'a> PlannerAgent<'a> {
     }
 
     /// Produce an implementation plan for the given refined spec.
-    pub async fn plan(&self, spec: &RefinedSpec) -> Result<ImplementationPlan, PipelineError> {
+    pub async fn plan(&self, spec: &RefinedSpec) -> Result<(ImplementationPlan, TokenUsage), PipelineError> {
         let spec_json = serde_json::to_string_pretty(spec)
             .map_err(|e| PipelineError::LlmError(format!("Failed to serialize spec: {e}")))?;
 
@@ -111,6 +111,7 @@ impl<'a> PlannerAgent<'a> {
         };
 
         let response = self.llm.chat(&request).await?;
+        let usage = response.usage.clone();
 
         let plan: ImplementationPlan =
             super::extract_json(&response.content).ok_or_else(|| {
@@ -126,9 +127,11 @@ impl<'a> PlannerAgent<'a> {
 
         tracing::info!(
             spec_name = %spec.spec.name,
+            input_tokens = usage.input_tokens,
+            output_tokens = usage.output_tokens,
             "Planner produced implementation plan"
         );
-        Ok(plan)
+        Ok((plan, usage))
     }
 }
 
@@ -181,7 +184,7 @@ mod tests {
         let agent = PlannerAgent::new(&client);
         let spec = make_refined_spec();
 
-        let plan = agent.plan(&spec).await.unwrap();
+        let (plan, _) = agent.plan(&spec).await.unwrap();
         assert!(plan.validation_layer.contains("channel_id"));
         assert!(plan.security_notes.contains("CRLF"));
         assert!(plan.api_sequence.contains("POST"));
@@ -208,7 +211,7 @@ mod tests {
         let agent = PlannerAgent::new(&client);
         let spec = make_refined_spec();
 
-        let plan = agent.plan(&spec).await.unwrap();
+        let (plan, _) = agent.plan(&spec).await.unwrap();
         assert_eq!(plan.validation_layer, "validate inputs");
     }
 }

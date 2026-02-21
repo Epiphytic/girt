@@ -133,14 +133,18 @@ def main():
                 print(f"  exploits blocked : {parsed.get('exploits_attempted')} attempted, {parsed.get('exploits_succeeded')} succeeded", flush=True)
                 t = parsed.get("timings", {})
                 if t:
+                    def tok(u): return f"{u.get('input_tokens',0)}in/{u.get('output_tokens',0)}out" if u else "n/a"
                     iters = t.get("iterations", [])
-                    print(f"  ── stage timings ────────────────────────────", flush=True)
-                    print(f"  architect        : {t.get('architect_ms', 0)}ms", flush=True)
-                    planner = t.get("planner_ms")
-                    print(f"  planner          : {planner}ms" if planner else "  planner          : skipped", flush=True)
+                    print(f"  ── stage timings + tokens ───────────────────", flush=True)
+                    print(f"  architect  : {t.get('architect_ms', 0)}ms  {tok(t.get('architect_tokens'))}", flush=True)
+                    pm, pt = t.get("planner_ms"), t.get("planner_tokens")
+                    print(f"  planner    : {pm}ms  {tok(pt)}" if pm else "  planner    : skipped", flush=True)
                     for it in iters:
-                        print(f"  iter {it['iteration']}: engineer={it['engineer_ms']}ms  qa={it['qa_ms']}ms  red_team={it['red_team_ms']}ms", flush=True)
-                    print(f"  total            : {t.get('total_ms', 0)}ms", flush=True)
+                        print(f"  iter {it['iteration']}:", flush=True)
+                        print(f"    engineer : {it['engineer_ms']}ms  {tok(it.get('engineer_tokens'))}", flush=True)
+                        print(f"    qa       : {it['qa_ms']}ms  {tok(it.get('qa_tokens'))}", flush=True)
+                        print(f"    red_team : {it['red_team_ms']}ms  {tok(it.get('red_team_tokens'))}", flush=True)
+                    print(f"  total      : {t.get('total_ms', 0)}ms", flush=True)
 
                 # verify new tool appears
                 send(proc, {"jsonrpc": "2.0", "id": 4, "method": "tools/list", "params": {}})

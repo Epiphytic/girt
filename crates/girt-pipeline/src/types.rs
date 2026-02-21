@@ -2,6 +2,8 @@ use chrono::{DateTime, Utc};
 use girt_core::spec::CapabilitySpec;
 use serde::{Deserialize, Serialize};
 
+use crate::llm::TokenUsage;
+
 /// A capability request in the build queue.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapabilityRequest {
@@ -197,24 +199,29 @@ pub struct SecurityResult {
     pub bug_tickets: Vec<BugTicket>,
 }
 
-/// Per-iteration timing breakdown (one entry per Engineer→QA→RedTeam cycle).
+/// Per-iteration timing + token breakdown (one entry per Engineer→QA→RedTeam cycle).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IterationTimings {
     pub iteration: u32,
     pub engineer_ms: u64,
+    pub engineer_tokens: TokenUsage,
     pub qa_ms: u64,
+    pub qa_tokens: TokenUsage,
     pub red_team_ms: u64,
+    pub red_team_tokens: TokenUsage,
 }
 
-/// Full timing breakdown for a pipeline run.
+/// Full timing + token breakdown for a pipeline run.
 ///
-/// Use this to identify which stage is the bottleneck before optimizing.
+/// Use this to identify which stage is the bottleneck and most expensive.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StageTimings {
     /// Architect phase (spec refinement).
     pub architect_ms: u64,
+    pub architect_tokens: TokenUsage,
     /// Planner phase (`None` if skipped for low-complexity specs).
     pub planner_ms: Option<u64>,
+    pub planner_tokens: Option<TokenUsage>,
     /// Per-iteration timings (one entry per Engineer→QA→RedTeam cycle).
     pub iterations: Vec<IterationTimings>,
     /// Total wall-clock time for the full pipeline run.
@@ -222,19 +229,32 @@ pub struct StageTimings {
 }
 
 impl StageTimings {
-    /// Aggregate engineer time across all iterations.
     pub fn total_engineer_ms(&self) -> u64 {
         self.iterations.iter().map(|i| i.engineer_ms).sum()
     }
-
-    /// Aggregate QA time across all iterations.
     pub fn total_qa_ms(&self) -> u64 {
         self.iterations.iter().map(|i| i.qa_ms).sum()
     }
-
-    /// Aggregate Red Team time across all iterations.
     pub fn total_red_team_ms(&self) -> u64 {
         self.iterations.iter().map(|i| i.red_team_ms).sum()
+    }
+    pub fn total_input_tokens(&self) -> u64 {
+        self.architect_tokens.input_tokens
+            + self.planner_tokens.as_ref().map_or(0, |t| t.input_tokens)
+            + self.iterations.iter().map(|i| {
+                i.engineer_tokens.input_tokens
+                    + i.qa_tokens.input_tokens
+                    + i.red_team_tokens.input_tokens
+            }).sum::<u64>()
+    }
+    pub fn total_output_tokens(&self) -> u64 {
+        self.architect_tokens.output_tokens
+            + self.planner_tokens.as_ref().map_or(0, |t| t.output_tokens)
+            + self.iterations.iter().map(|i| {
+                i.engineer_tokens.output_tokens
+                    + i.qa_tokens.output_tokens
+                    + i.red_team_tokens.output_tokens
+            }).sum::<u64>()
     }
 }
 

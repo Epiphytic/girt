@@ -7,8 +7,9 @@ use crate::error::PipelineError;
 use crate::llm::LlmClient;
 use std::time::Instant;
 
+use crate::llm::TokenUsage;
 use crate::types::{
-    BugTicket, BuildArtifact, BugTicketSeverity, CapabilityRequest, ComplexityHint,
+    BugTicket, BugTicketSeverity, BuildArtifact, CapabilityRequest, ComplexityHint,
     ImplementationPlan, IterationTimings, RefinedSpec, SpecAction, StageTimings,
 };
 
@@ -72,15 +73,16 @@ impl<'a> Orchestrator<'a> {
 
         // Phase 1: Architect refines the spec
         let arch_start = Instant::now();
-        let refined = match self.architect_phase(&request.spec).await {
-            Ok(refined) => refined,
+        let (refined, architect_tokens) = match self.architect_phase(&request.spec).await {
+            Ok(result) => result,
             Err(e) => {
                 tracing::warn!(error = %e, "Architect failed, using passthrough spec");
-                ArchitectAgent::passthrough(&request.spec)
+                (ArchitectAgent::passthrough(&request.spec), TokenUsage::default())
             }
         };
         let architect_ms = arch_start.elapsed().as_millis() as u64;
-        tracing::info!(architect_ms, "Architect phase complete");
+        tracing::info!(architect_ms, input_tokens = architect_tokens.input_tokens,
+            output_tokens = architect_tokens.output_tokens, "Architect phase complete");
 
         // Check if architect recommends extending instead of building
         if refined.action == SpecAction::RecommendExtend {
@@ -92,19 +94,21 @@ impl<'a> Orchestrator<'a> {
 
         // Phase 1.5: Planner (runs for complex specs before Engineer)
         let planner_start = Instant::now();
-        let plan = self.planner_phase(&refined).await;
-        let planner_ms = if plan.is_some() {
-            Some(planner_start.elapsed().as_millis() as u64)
+        let planner_result = self.planner_phase(&refined).await;
+        let (plan, planner_ms, planner_tokens) = if let Some((p, u)) = planner_result {
+            let ms = planner_start.elapsed().as_millis() as u64;
+            tracing::info!(planner_ms = ms, input_tokens = u.input_tokens,
+                output_tokens = u.output_tokens, "Planner phase complete");
+            (Some(p), Some(ms), Some(u))
         } else {
-            None
+            (None, None, None)
         };
-        if let Some(ms) = planner_ms {
-            tracing::info!(planner_ms = ms, "Planner phase complete");
-        }
 
         let partial_timings = StageTimings {
             architect_ms,
+            architect_tokens,
             planner_ms,
+            planner_tokens,
             iterations: vec![],
             total_ms: 0,
         };
@@ -119,15 +123,15 @@ impl<'a> Orchestrator<'a> {
     async fn architect_phase(
         &self,
         spec: &girt_core::spec::CapabilitySpec,
-    ) -> Result<RefinedSpec, PipelineError> {
+    ) -> Result<(RefinedSpec, TokenUsage), PipelineError> {
         let architect = ArchitectAgent::new(self.llm);
-        let refined = architect.refine(spec).await?;
+        let (refined, usage) = architect.refine(spec).await?;
         tracing::info!(name = %refined.spec.name, action = ?refined.action, "Spec refined");
-        Ok(refined)
+        Ok((refined, usage))
     }
 
     /// Run the Planner if the spec meets complexity triggers; return `None` on skip or failure.
-    async fn planner_phase(&self, spec: &RefinedSpec) -> Option<ImplementationPlan> {
+    async fn planner_phase(&self, spec: &RefinedSpec) -> Option<(ImplementationPlan, TokenUsage)> {
         if !needs_planner(spec) {
             tracing::debug!(spec_name = %spec.spec.name, "Planner skipped (low complexity)");
             return None;
@@ -135,12 +139,11 @@ impl<'a> Orchestrator<'a> {
 
         tracing::info!(spec_name = %spec.spec.name, "Running Planner (complex spec detected)");
         match PlannerAgent::new(self.llm).plan(spec).await {
-            Ok(plan) => {
+            Ok((plan, usage)) => {
                 tracing::info!(spec_name = %spec.spec.name, "Planner completed");
-                Some(plan)
+                Some((plan, usage))
             }
             Err(e) => {
-                // Non-fatal: log and let the Engineer proceed without a plan.
                 tracing::warn!(
                     error = %e,
                     spec_name = %spec.spec.name,
@@ -165,27 +168,29 @@ impl<'a> Orchestrator<'a> {
         let red_team = RedTeamAgent::new(self.llm);
 
         let eng_start = Instant::now();
-        let mut build_output = engineer.build(spec).await?;
+        let (mut build_output, mut last_engineer_tokens) = engineer.build(spec).await?;
         let mut last_engineer_ms = eng_start.elapsed().as_millis() as u64;
         let mut iteration = 1u32;
 
         loop {
             tracing::info!(iteration, "Build iteration starting");
 
-            // Run QA and Red Team, capturing timing for each
             let qa_start = Instant::now();
-            let qa_result = qa.test(spec, &build_output).await?;
+            let (qa_result, qa_tokens) = qa.test(spec, &build_output).await?;
             let qa_ms = qa_start.elapsed().as_millis() as u64;
 
             let rt_start = Instant::now();
-            let security_result = red_team.audit(spec, &build_output).await?;
+            let (security_result, red_team_tokens) = red_team.audit(spec, &build_output).await?;
             let red_team_ms = rt_start.elapsed().as_millis() as u64;
 
             timings.iterations.push(IterationTimings {
                 iteration,
                 engineer_ms: last_engineer_ms,
+                engineer_tokens: last_engineer_tokens.clone(),
                 qa_ms,
+                qa_tokens,
                 red_team_ms,
+                red_team_tokens,
             });
             tracing::info!(
                 iteration, last_engineer_ms, qa_ms, red_team_ms,
@@ -222,7 +227,9 @@ impl<'a> Orchestrator<'a> {
                     total_engineer_ms = timings.total_engineer_ms(),
                     total_qa_ms = timings.total_qa_ms(),
                     total_red_team_ms = timings.total_red_team_ms(),
-                    "Pipeline passed — stage timing summary"
+                    total_input_tokens = timings.total_input_tokens(),
+                    total_output_tokens = timings.total_output_tokens(),
+                    "Pipeline passed — stage timing + token summary"
                 );
                 return Ok(Box::new(BuildArtifact {
                     spec: spec.spec.clone(),
@@ -261,8 +268,10 @@ impl<'a> Orchestrator<'a> {
                     "Sending fix directive to engineer"
                 );
                 let fix_start = Instant::now();
-                build_output = engineer.fix(spec, &build_output, ticket).await?;
+                let (fixed_output, fix_tokens) = engineer.fix(spec, &build_output, ticket).await?;
+                build_output = fixed_output;
                 last_engineer_ms = fix_start.elapsed().as_millis() as u64;
+                last_engineer_tokens = fix_tokens;
             }
 
             iteration += 1;
@@ -281,12 +290,18 @@ impl<'a> Orchestrator<'a> {
 
         let pipeline_start = Instant::now();
         let planner_start = Instant::now();
-        let plan = self.planner_phase(spec).await;
-        let planner_ms = plan.as_ref().map(|_| planner_start.elapsed().as_millis() as u64);
+        let planner_result = self.planner_phase(spec).await;
+        let (plan, planner_ms, planner_tokens) = if let Some((p, u)) = planner_result {
+            (Some(p), Some(planner_start.elapsed().as_millis() as u64), Some(u))
+        } else {
+            (None, None, None)
+        };
 
         let timings = StageTimings {
             architect_ms: 0,
+            architect_tokens: TokenUsage::default(),
             planner_ms,
+            planner_tokens,
             iterations: vec![],
             total_ms: 0,
         };

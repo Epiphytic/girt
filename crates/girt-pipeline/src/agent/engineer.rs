@@ -1,5 +1,5 @@
 use crate::error::PipelineError;
-use crate::llm::{LlmClient, LlmMessage, LlmRequest};
+use crate::llm::{LlmClient, LlmMessage, LlmRequest, TokenUsage};
 use crate::types::{BugTicket, BuildOutput, ImplementationPlan, PolicyYaml, RefinedSpec, TargetLanguage};
 
 const ENGINEER_RUST_PROMPT: &str = r#"You are a Senior Backend Engineer. You write functions that compile to wasm32-wasi Components and run inside girt-runtime, a Wasmtime-based WASM sandbox.
@@ -252,7 +252,7 @@ impl<'a> EngineerAgent<'a> {
     }
 
     /// Generate initial code from a refined spec.
-    pub async fn build(&self, spec: &RefinedSpec) -> Result<BuildOutput, PipelineError> {
+    pub async fn build(&self, spec: &RefinedSpec) -> Result<(BuildOutput, TokenUsage), PipelineError> {
         let spec_json = serde_json::to_string_pretty(spec)
             .map_err(|e| PipelineError::LlmError(format!("Failed to serialize spec: {e}")))?;
 
@@ -271,7 +271,9 @@ impl<'a> EngineerAgent<'a> {
         };
 
         let response = self.llm.chat(&request).await?;
-        self.parse_build_output(&response.content, spec)
+        let usage = response.usage.clone();
+        let output = self.parse_build_output(&response.content, spec)?;
+        Ok((output, usage))
     }
 
     /// Fix code based on a bug ticket.
@@ -280,7 +282,7 @@ impl<'a> EngineerAgent<'a> {
         spec: &RefinedSpec,
         previous_output: &BuildOutput,
         ticket: &BugTicket,
-    ) -> Result<BuildOutput, PipelineError> {
+    ) -> Result<(BuildOutput, TokenUsage), PipelineError> {
         let ticket_json = serde_json::to_string_pretty(ticket)
             .map_err(|e| PipelineError::LlmError(format!("Failed to serialize ticket: {e}")))?;
 
@@ -302,7 +304,9 @@ impl<'a> EngineerAgent<'a> {
         };
 
         let response = self.llm.chat(&request).await?;
-        self.parse_build_output(&response.content, spec)
+        let usage = response.usage.clone();
+        let output = self.parse_build_output(&response.content, spec)?;
+        Ok((output, usage))
     }
 
     fn parse_build_output(
@@ -370,7 +374,7 @@ mod tests {
         let agent = EngineerAgent::new(&client);
         let spec = make_refined_spec();
 
-        let output = agent.build(&spec).await.unwrap();
+        let (output, _) = agent.build(&spec).await.unwrap();
         assert_eq!(output.language, "rust");
         assert!(output.source_code.contains("convert"));
     }
@@ -381,7 +385,7 @@ mod tests {
         let agent = EngineerAgent::new(&client);
         let spec = make_refined_spec();
 
-        let output = agent.build(&spec).await.unwrap();
+        let (output, _) = agent.build(&spec).await.unwrap();
         assert!(output.source_code.contains("raw code"));
         assert_eq!(output.language, "rust");
     }
@@ -392,7 +396,7 @@ mod tests {
         let agent = EngineerAgent::with_target(&client, TargetLanguage::Go);
         let spec = make_refined_spec();
 
-        let output = agent.build(&spec).await.unwrap();
+        let (output, _) = agent.build(&spec).await.unwrap();
         assert_eq!(output.language, "go");
         assert!(output.source_code.contains("package main"));
     }
@@ -403,7 +407,7 @@ mod tests {
         let agent = EngineerAgent::with_target(&client, TargetLanguage::AssemblyScript);
         let spec = make_refined_spec();
 
-        let output = agent.build(&spec).await.unwrap();
+        let (output, _) = agent.build(&spec).await.unwrap();
         assert_eq!(output.language, "assemblyscript");
     }
 
@@ -420,7 +424,7 @@ mod tests {
         let agent = EngineerAgent::with_target(&client, TargetLanguage::Go);
         let spec = make_refined_spec();
 
-        let output = agent.build(&spec).await.unwrap();
+        let (output, _) = agent.build(&spec).await.unwrap();
         assert_eq!(output.language, "go");
         assert!(output.source_code.contains("Convert"));
     }

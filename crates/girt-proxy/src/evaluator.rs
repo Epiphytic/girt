@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use girt_core::error::DecisionError;
 use girt_core::layers::llm::{LlmDecision, LlmDecisionKind, LlmEvaluator};
-use girt_core::spec::{GateInput, ExecutionRequest};
+use girt_core::spec::GateInput;
 use girt_pipeline::llm::{LlmClient, LlmMessage, LlmRequest};
 
 const CREATION_SYSTEM_PROMPT: &str = r#"You are the GIRT Creation Gate — a security and policy evaluator for tool creation requests.

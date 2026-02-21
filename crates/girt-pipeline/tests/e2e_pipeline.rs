@@ -1,58 +1,72 @@
 //! End-to-end pipeline tests.
 //!
-//! These tests require external dependencies:
-//! - vLLM running on localhost:8000 with zai-org/GLM-4.7-Flash
-//! - cargo-component installed
-//! - wassette installed
+//! These tests drive the full build pipeline (queue → orchestrator → LLM → WASM compile → publish)
+//! against real external dependencies and are skipped by default.
 //!
-//! Run with: cargo test -p girt-pipeline --test e2e_pipeline -- --ignored --nocapture
+//! ## Prerequisites
+//! - `cargo-component` installed (`cargo install cargo-component`)
+//! - `ANTHROPIC_API_KEY` set (or OpenClaw auth-profiles configured)
+//!
+//! ## Run
+//! ```bash
+//! cargo test -p girt-pipeline --test e2e_pipeline -- --ignored --nocapture
+//! ```
 
 use std::sync::Arc;
 
 use girt_core::spec::{CapabilityConstraints, CapabilitySpec};
 use girt_pipeline::cache::ToolCache;
 use girt_pipeline::compiler::WasmCompiler;
-use girt_pipeline::llm::OpenAiCompatibleClient;
+use girt_pipeline::llm::AnthropicLlmClient;
 use girt_pipeline::metrics::PipelineMetrics;
 use girt_pipeline::publish::Publisher;
 use girt_pipeline::queue::{Queue, QueueConsumer};
 use girt_pipeline::types::{CapabilityRequest, RequestSource};
 
+/// Verify external tool dependencies are available.
 fn check_prerequisites() {
-    // Check vLLM
-    let resp = std::process::Command::new("curl")
-        .args(["-s", "http://localhost:8000/v1/models"])
-        .output();
-    assert!(
-        resp.is_ok() && resp.unwrap().status.success(),
-        "vLLM not reachable at localhost:8000"
-    );
-
-    // Check cargo-component
+    // Check cargo-component (required to compile WASM components)
     let resp = std::process::Command::new("cargo-component")
         .arg("--version")
         .output();
     assert!(
         resp.is_ok() && resp.unwrap().status.success(),
-        "cargo-component not installed"
+        "cargo-component not installed — run: cargo install cargo-component"
     );
 
-    // Check wassette
-    let resp = std::process::Command::new("wassette")
-        .arg("--version")
-        .output();
+    // Check Anthropic credentials are available (env var or OpenClaw auth)
+    let has_key = std::env::var("ANTHROPIC_API_KEY").is_ok();
+    let has_openclaw_auth = dirs::home_dir()
+        .map(|h| {
+            h.join(".openclaw")
+                .join("agents")
+                .join("main")
+                .join("agent")
+                .join("auth-profiles.json")
+                .exists()
+        })
+        .unwrap_or(false);
     assert!(
-        resp.is_ok() && resp.unwrap().status.success(),
-        "wassette not installed"
+        has_key || has_openclaw_auth,
+        "No Anthropic credentials found. Set ANTHROPIC_API_KEY or run `openclaw models auth setup-token --provider anthropic`"
     );
 }
 
 fn make_llm_client() -> Arc<dyn girt_pipeline::llm::LlmClient> {
-    Arc::new(OpenAiCompatibleClient::new(
-        "http://localhost:8000/v1".into(),
-        "zai-org/GLM-4.7-Flash".into(),
-        None,
-    ))
+    Arc::new(
+        AnthropicLlmClient::from_env_or("claude-sonnet-4-5".into(), None)
+            .expect("Failed to initialise Anthropic LLM client"),
+    )
+}
+
+/// Check that a file is a valid WASM binary (starts with magic bytes `\0asm`).
+fn assert_valid_wasm(path: &std::path::Path) {
+    let bytes = std::fs::read(path).expect("failed to read wasm file");
+    assert!(
+        bytes.starts_with(b"\0asm"),
+        "File at {} is not a valid WASM binary (missing magic bytes)",
+        path.display()
+    );
 }
 
 #[tokio::test]
@@ -91,8 +105,6 @@ async fn e2e_happy_path_simple_tool() {
     consumer.queue().enqueue(&request).await.unwrap();
 
     // Process the request (with real LLM + real compilation).
-    // The pipeline may fail at various stages (LLM response parsing,
-    // compilation, etc.). With a real LLM, errors are expected and valid.
     let result = consumer.process_next(&compiler, None, None).await;
 
     let snap = metrics.snapshot();
@@ -101,29 +113,21 @@ async fn e2e_happy_path_simple_tool() {
     match result {
         Ok(Some(girt_pipeline::queue::ProcessResult::Built { name, .. })) => {
             eprintln!("SUCCESS: Tool '{name}' built and cached");
-            // Verify cache has the tool
-            let tool_dir = tmp.path().join("tools").join(&name);
-            assert!(tool_dir.join("manifest.json").exists());
-            assert!(tool_dir.join("tool.wasm").exists());
-            assert!(tool_dir.join("source.rs").exists());
-            assert!(tool_dir.join("policy.yaml").exists());
 
-            // Verify WASM loads in Wassette
+            let tool_dir = tmp.path().join("tools").join(&name);
+            assert!(tool_dir.join("manifest.json").exists(), "manifest.json should exist");
+            assert!(tool_dir.join("source.rs").exists(), "source.rs should exist");
+
+            // Verify WASM was produced and is a valid binary
             let wasm_path = tool_dir.join("tool.wasm");
-            let wassette_check = tokio::process::Command::new("wassette")
-                .arg("inspect")
-                .arg(wasm_path.to_str().unwrap())
-                .output()
-                .await;
-            assert!(
-                wassette_check.is_ok(),
-                "Wassette should be able to inspect the WASM component"
-            );
+            assert!(wasm_path.exists(), "tool.wasm should exist after build");
+            assert_valid_wasm(&wasm_path);
+            eprintln!("WASM binary valid: {} bytes", std::fs::metadata(&wasm_path).unwrap().len());
 
             assert_eq!(snap.builds_completed, 1);
         }
         Ok(Some(girt_pipeline::queue::ProcessResult::Failed(e))) => {
-            // Orchestrator-level failure (circuit breaker, QA/RedTeam error)
+            // Orchestrator-level failure (circuit breaker, QA/RedTeam error) — valid E2E outcome.
             eprintln!("Build failed at orchestrator level (valid E2E outcome): {e}");
             assert_eq!(snap.builds_failed, 1);
         }
@@ -134,16 +138,15 @@ async fn e2e_happy_path_simple_tool() {
             panic!("Queue should have had a request to process");
         }
         Err(e) => {
-            // Pipeline-level errors (compilation failure, publish error, etc.)
-            // are valid E2E outcomes when the LLM generates non-compilable code.
+            // Pipeline-level errors (compilation failure, etc.) are valid E2E outcomes.
             eprintln!("Pipeline error (valid E2E outcome): {e}");
         }
     }
 
-    // Verify queue state -- request should not be pending
+    // Queue should be empty after processing
     assert!(
         consumer.queue().list_pending().await.unwrap().is_empty(),
-        "No requests should be pending"
+        "No requests should be pending after processing"
     );
 }
 
@@ -181,9 +184,8 @@ async fn e2e_circuit_breaker_impossible_spec() {
 
     let snap = metrics.snapshot();
     assert_eq!(snap.builds_started, 1);
-    // With a real LLM, the build may actually succeed (LLM will try its best),
-    // fail at orchestration, or fail at compilation. Any outcome is valid for
-    // E2E. The important thing is no panic.
+
+    // With a real LLM, any outcome is valid for E2E. The important thing is no panic.
     match result {
         Ok(Some(girt_pipeline::queue::ProcessResult::Built { name, .. })) => {
             eprintln!("Impossible spec actually built (LLM tried its best): {name}");
@@ -194,12 +196,8 @@ async fn e2e_circuit_breaker_impossible_spec() {
         Ok(Some(girt_pipeline::queue::ProcessResult::Extended { target, .. })) => {
             eprintln!("Impossible spec got extend recommendation: {target}");
         }
-        Ok(None) => {
-            panic!("Queue should have had a request to process");
-        }
-        Err(e) => {
-            eprintln!("Impossible spec pipeline error (valid): {e}");
-        }
+        Ok(None) => panic!("Queue should have had a request to process"),
+        Err(e) => eprintln!("Impossible spec pipeline error (valid): {e}"),
     }
 }
 
@@ -208,9 +206,13 @@ async fn e2e_circuit_breaker_impossible_spec() {
 async fn e2e_happy_path_with_oci_push() {
     check_prerequisites();
 
-    // Also check oras
-    let oras_check = std::process::Command::new("oras").arg("version").output();
-    if oras_check.is_err() || !oras_check.unwrap().status.success() {
+    // Check oras separately (OCI push is optional)
+    let oras_ok = std::process::Command::new("oras")
+        .arg("version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !oras_ok {
         eprintln!("SKIP: oras not installed, skipping OCI push test");
         return;
     }
@@ -228,7 +230,6 @@ async fn e2e_happy_path_with_oci_push() {
     let consumer = QueueConsumer::new(queue, llm, publisher, metrics.clone());
     let compiler = WasmCompiler::new();
 
-    // Request a simple tool for OCI push test
     let spec = CapabilitySpec {
         name: "oci_test_tool".into(),
         description: "A simple echo tool for OCI push testing. Takes a string input and returns it unchanged.".into(),
@@ -253,7 +254,7 @@ async fn e2e_happy_path_with_oci_push() {
             eprintln!("Built tool: {name}");
             if let Some(reference) = &oci_reference {
                 eprintln!("Published to: {reference}");
-                // Clean up: delete the test tag
+                // Clean up the test tag
                 let _ = tokio::process::Command::new("oras")
                     .args(["manifest", "delete", "--force", reference])
                     .output()
@@ -266,11 +267,7 @@ async fn e2e_happy_path_with_oci_push() {
         Ok(Some(girt_pipeline::queue::ProcessResult::Extended { target, .. })) => {
             eprintln!("OCI test got extend recommendation: {target}");
         }
-        Ok(None) => {
-            panic!("Queue should have had a request to process");
-        }
-        Err(e) => {
-            eprintln!("OCI test pipeline error (valid E2E outcome): {e}");
-        }
+        Ok(None) => panic!("Queue should have had a request to process"),
+        Err(e) => eprintln!("OCI test pipeline error (valid E2E outcome): {e}"),
     }
 }

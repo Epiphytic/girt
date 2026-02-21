@@ -182,11 +182,15 @@ pub struct AnthropicLlmClient {
 
 impl AnthropicLlmClient {
     pub fn new(model: String, api_key: String) -> Self {
-        Self {
-            http: reqwest::Client::new(),
-            model,
-            api_key,
-        }
+        let http = reqwest::Client::builder()
+            // Anthropic closes idle connections; avoid reusing stale ones
+            .pool_idle_timeout(std::time::Duration::from_secs(25))
+            .pool_max_idle_per_host(2)
+            // Pipeline calls can be large (Engineer generates full source) — generous timeout
+            .timeout(std::time::Duration::from_secs(180))
+            .build()
+            .expect("reqwest Client build should not fail");
+        Self { http, model, api_key }
     }
 
     /// Resolve the Anthropic token using the following priority:
@@ -232,16 +236,25 @@ impl LlmClient for AnthropicLlmClient {
                 "messages": messages,
             });
 
-            // OAuth tokens (sk-ant-oat...) use Authorization: Bearer.
-            // Standard API keys (sk-ant-api...) use x-api-key.
+            // OAuth tokens (sk-ant-oat...) require:
+            //   Authorization: Bearer <token>
+            //   anthropic-beta: claude-code-20250219,oauth-2025-04-20
+            //
+            // Standard API keys (sk-ant-api...) use:
+            //   x-api-key: <key>
+            //
+            // Source: OpenClaw dist/pi-embedded-*.js — PI_AI_OAUTH_ANTHROPIC_BETAS
+            let is_oauth = self.api_key.starts_with("sk-ant-oat");
+
             let mut req = self
                 .http
                 .post("https://api.anthropic.com/v1/messages")
                 .header("anthropic-version", "2023-06-01")
                 .header("content-type", "application/json");
 
-            req = if self.api_key.starts_with("sk-ant-oat") {
+            req = if is_oauth {
                 req.header("Authorization", format!("Bearer {}", self.api_key))
+                   .header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20")
             } else {
                 req.header("x-api-key", &self.api_key)
             };

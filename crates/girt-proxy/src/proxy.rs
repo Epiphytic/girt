@@ -185,7 +185,7 @@ impl ServerHandler for GirtProxy {
 
     async fn list_tools(
         &self,
-        request: Option<PaginatedRequestParams>,
+        _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
         tracing::debug!("Listing tools");

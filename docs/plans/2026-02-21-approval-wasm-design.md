@@ -209,6 +209,41 @@ request's JSON file in the queue.
 
 ---
 
+## GIRT Tool Convention: Continue Signal
+
+WASM components have a natural execution time limit (~60 seconds). Operations
+that may take longer — waiting for human input, polling an external queue,
+streaming a large result — must not block indefinitely. Instead, they use the
+**continue-signal pattern**:
+
+1. The tool runs for up to its execution budget, does useful work, and returns
+2. If the operation is not complete, it returns `status: "pending"` plus a
+   **resume token** (an opaque identifier the next invocation uses to pick up
+   where it left off — e.g. a Discord `message_id`, a job ID, a cursor)
+3. The caller (MCP client, orchestrator, Claude Code) re-invokes with the
+   resume token; the tool skips setup and goes straight to checking status
+4. The loop continues until the tool returns a terminal status (`approved`,
+   `denied`, `complete`, `failed`, etc.) or the caller's overall deadline
+   expires
+
+**Responsibilities:**
+- **WASM tool**: do work, return terminal or pending. Never loops indefinitely.
+  Per-invocation timeout: ≤60s. Poll interval: reasonable (5–15s).
+- **Caller**: owns the re-invocation loop, overall deadline, escalation,
+  cleanup. Interprets `pending` as "call me again with this token."
+
+**This is standard practice** (pagination cursors, chunked responses, async
+job polling). GIRT tools that can exceed 60s must document their resume token
+in the output schema and indicate in their description that `pending` means
+re-invoke.
+
+The discord_approval WASM is the first GIRT tool implementing this pattern:
+- First call: post message, poll for ≤60s, return `{status, message_id}`
+- Re-invocation: pass `message_id`, skip posting, poll for ≤60s, return again
+- Caller loops until `approved`/`denied` or overall timeout
+
+---
+
 ## Implementation Order
 
 1. [ ] ADR-011 merged (this branch)

@@ -197,6 +197,47 @@ pub struct SecurityResult {
     pub bug_tickets: Vec<BugTicket>,
 }
 
+/// Per-iteration timing breakdown (one entry per Engineer→QA→RedTeam cycle).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IterationTimings {
+    pub iteration: u32,
+    pub engineer_ms: u64,
+    pub qa_ms: u64,
+    pub red_team_ms: u64,
+}
+
+/// Full timing breakdown for a pipeline run.
+///
+/// Use this to identify which stage is the bottleneck before optimizing.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StageTimings {
+    /// Architect phase (spec refinement).
+    pub architect_ms: u64,
+    /// Planner phase (`None` if skipped for low-complexity specs).
+    pub planner_ms: Option<u64>,
+    /// Per-iteration timings (one entry per Engineer→QA→RedTeam cycle).
+    pub iterations: Vec<IterationTimings>,
+    /// Total wall-clock time for the full pipeline run.
+    pub total_ms: u64,
+}
+
+impl StageTimings {
+    /// Aggregate engineer time across all iterations.
+    pub fn total_engineer_ms(&self) -> u64 {
+        self.iterations.iter().map(|i| i.engineer_ms).sum()
+    }
+
+    /// Aggregate QA time across all iterations.
+    pub fn total_qa_ms(&self) -> u64 {
+        self.iterations.iter().map(|i| i.qa_ms).sum()
+    }
+
+    /// Aggregate Red Team time across all iterations.
+    pub fn total_red_team_ms(&self) -> u64 {
+        self.iterations.iter().map(|i| i.red_team_ms).sum()
+    }
+}
+
 /// The final build artifact ready for publishing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuildArtifact {
@@ -206,6 +247,8 @@ pub struct BuildArtifact {
     pub qa_result: QaResult,
     pub security_result: SecurityResult,
     pub build_iterations: u32,
+    /// Per-stage timing breakdown for this pipeline run.
+    pub timings: StageTimings,
 }
 
 /// Wassette policy.yaml content.

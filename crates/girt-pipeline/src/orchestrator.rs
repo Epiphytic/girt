@@ -5,9 +5,11 @@ use crate::agent::qa::QaAgent;
 use crate::agent::red_team::RedTeamAgent;
 use crate::error::PipelineError;
 use crate::llm::LlmClient;
+use std::time::Instant;
+
 use crate::types::{
-    BugTicket, BuildArtifact, CapabilityRequest, ComplexityHint, ImplementationPlan, RefinedSpec,
-    SpecAction, BugTicketSeverity,
+    BugTicket, BuildArtifact, BugTicketSeverity, CapabilityRequest, ComplexityHint,
+    ImplementationPlan, IterationTimings, RefinedSpec, SpecAction, StageTimings,
 };
 
 /// Default maximum build-fix iterations. Override via `pipeline.max_iterations` in girt.toml.
@@ -66,7 +68,10 @@ impl<'a> Orchestrator<'a> {
 
     /// Run the full pipeline for a capability request.
     pub async fn run(&self, request: &CapabilityRequest) -> PipelineOutcome {
+        let pipeline_start = Instant::now();
+
         // Phase 1: Architect refines the spec
+        let arch_start = Instant::now();
         let refined = match self.architect_phase(&request.spec).await {
             Ok(refined) => refined,
             Err(e) => {
@@ -74,6 +79,8 @@ impl<'a> Orchestrator<'a> {
                 ArchitectAgent::passthrough(&request.spec)
             }
         };
+        let architect_ms = arch_start.elapsed().as_millis() as u64;
+        tracing::info!(architect_ms, "Architect phase complete");
 
         // Check if architect recommends extending instead of building
         if refined.action == SpecAction::RecommendExtend {
@@ -84,10 +91,26 @@ impl<'a> Orchestrator<'a> {
         }
 
         // Phase 1.5: Planner (runs for complex specs before Engineer)
+        let planner_start = Instant::now();
         let plan = self.planner_phase(&refined).await;
+        let planner_ms = if plan.is_some() {
+            Some(planner_start.elapsed().as_millis() as u64)
+        } else {
+            None
+        };
+        if let Some(ms) = planner_ms {
+            tracing::info!(planner_ms = ms, "Planner phase complete");
+        }
+
+        let partial_timings = StageTimings {
+            architect_ms,
+            planner_ms,
+            iterations: vec![],
+            total_ms: 0,
+        };
 
         // Phase 2-4: Build loop with QA and Red Team validation
-        match self.build_loop(&refined, plan).await {
+        match self.build_loop(&refined, plan, partial_timings, pipeline_start).await {
             Ok(artifact) => PipelineOutcome::Built(artifact),
             Err(e) => PipelineOutcome::Failed(e),
         }
@@ -132,6 +155,8 @@ impl<'a> Orchestrator<'a> {
         &self,
         spec: &RefinedSpec,
         plan: Option<ImplementationPlan>,
+        mut timings: StageTimings,
+        pipeline_start: Instant,
     ) -> Result<Box<BuildArtifact>, PipelineError> {
         let engineer = EngineerAgent::new(self.llm)
             .with_standards(self.coding_standards.clone())
@@ -139,15 +164,33 @@ impl<'a> Orchestrator<'a> {
         let qa = QaAgent::new(self.llm);
         let red_team = RedTeamAgent::new(self.llm);
 
+        let eng_start = Instant::now();
         let mut build_output = engineer.build(spec).await?;
+        let mut last_engineer_ms = eng_start.elapsed().as_millis() as u64;
         let mut iteration = 1u32;
 
         loop {
             tracing::info!(iteration, "Build iteration starting");
 
-            // Run QA and Red Team
+            // Run QA and Red Team, capturing timing for each
+            let qa_start = Instant::now();
             let qa_result = qa.test(spec, &build_output).await?;
+            let qa_ms = qa_start.elapsed().as_millis() as u64;
+
+            let rt_start = Instant::now();
             let security_result = red_team.audit(spec, &build_output).await?;
+            let red_team_ms = rt_start.elapsed().as_millis() as u64;
+
+            timings.iterations.push(IterationTimings {
+                iteration,
+                engineer_ms: last_engineer_ms,
+                qa_ms,
+                red_team_ms,
+            });
+            tracing::info!(
+                iteration, last_engineer_ms, qa_ms, red_team_ms,
+                "Iteration timings"
+            );
 
             // Collect all bug tickets from both agents
             let mut all_tickets: Vec<BugTicket> = Vec::new();
@@ -169,10 +212,17 @@ impl<'a> Orchestrator<'a> {
 
             // Pass when no blocking tickets remain (advisory tickets are fine)
             if blocking.is_empty() {
+                timings.total_ms = pipeline_start.elapsed().as_millis() as u64;
                 tracing::info!(
                     iterations = iteration,
                     advisory = advisory.len(),
-                    "Pipeline passed all critical/high checks"
+                    total_ms = timings.total_ms,
+                    architect_ms = timings.architect_ms,
+                    planner_ms = ?timings.planner_ms,
+                    total_engineer_ms = timings.total_engineer_ms(),
+                    total_qa_ms = timings.total_qa_ms(),
+                    total_red_team_ms = timings.total_red_team_ms(),
+                    "Pipeline passed — stage timing summary"
                 );
                 return Ok(Box::new(BuildArtifact {
                     spec: spec.spec.clone(),
@@ -181,16 +231,19 @@ impl<'a> Orchestrator<'a> {
                     qa_result,
                     security_result,
                     build_iterations: iteration,
+                    timings,
                 }));
             }
 
             // Circuit breaker fires only if blocking tickets remain
             if iteration >= self.max_iterations {
                 let summary = format_ticket_summary(&blocking);
+                timings.total_ms = pipeline_start.elapsed().as_millis() as u64;
                 tracing::error!(
                     iteration,
                     blocking = blocking.len(),
                     advisory = advisory.len(),
+                    total_ms = timings.total_ms,
                     "Circuit breaker: max iterations reached with blocking tickets"
                 );
                 return Err(PipelineError::CircuitBreaker {
@@ -207,7 +260,9 @@ impl<'a> Orchestrator<'a> {
                     ticket_type = ?ticket.ticket_type,
                     "Sending fix directive to engineer"
                 );
+                let fix_start = Instant::now();
                 build_output = engineer.fix(spec, &build_output, ticket).await?;
+                last_engineer_ms = fix_start.elapsed().as_millis() as u64;
             }
 
             iteration += 1;
@@ -224,8 +279,19 @@ impl<'a> Orchestrator<'a> {
             };
         }
 
+        let pipeline_start = Instant::now();
+        let planner_start = Instant::now();
         let plan = self.planner_phase(spec).await;
-        match self.build_loop(spec, plan).await {
+        let planner_ms = plan.as_ref().map(|_| planner_start.elapsed().as_millis() as u64);
+
+        let timings = StageTimings {
+            architect_ms: 0,
+            planner_ms,
+            iterations: vec![],
+            total_ms: 0,
+        };
+
+        match self.build_loop(spec, plan, timings, pipeline_start).await {
             Ok(artifact) => PipelineOutcome::Built(artifact),
             Err(e) => PipelineOutcome::Failed(e),
         }

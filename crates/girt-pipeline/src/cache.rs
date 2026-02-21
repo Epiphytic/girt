@@ -171,6 +171,7 @@ mod tests {
                 bug_tickets: vec![],
             },
             build_iterations: 1,
+            timings: Default::default(),
         }
     }
 

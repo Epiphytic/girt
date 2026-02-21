@@ -44,6 +44,7 @@ pub enum DecisionLayer {
     Cache,
     RegistryLookup,
     CliCheck,
+    Similarity,
     LlmEvaluation,
     Hitl,
 }
@@ -55,6 +56,7 @@ impl std::fmt::Display for DecisionLayer {
             DecisionLayer::Cache => write!(f, "cache"),
             DecisionLayer::RegistryLookup => write!(f, "registry_lookup"),
             DecisionLayer::CliCheck => write!(f, "cli_check"),
+            DecisionLayer::Similarity => write!(f, "similarity"),
             DecisionLayer::LlmEvaluation => write!(f, "llm_evaluation"),
             DecisionLayer::Hitl => write!(f, "hitl"),
         }

@@ -1,8 +1,23 @@
 [llm]
-provider = "openai-compatible"
-base_url = "http://localhost:8000/v1"
-model = "zai-org/GLM-4.7-Flash"
+# provider options:
+#   "anthropic"         — Anthropic Claude (recommended)
+#   "openai-compatible" — Any OpenAI-compatible endpoint (e.g. vLLM, Ollama)
+#   "stub"              — Deterministic no-op for testing
+provider = "anthropic"
+model = "claude-sonnet-4-5"
 max_tokens = 4096
+
+# Credential resolution order (anthropic provider):
+#   1. ANTHROPIC_API_KEY environment variable
+#   2. OpenClaw auth-profiles (~/.openclaw/agents/main/agent/auth-profiles.json)
+#      — if you've run `openclaw models auth setup-token --provider anthropic`, no config needed
+#   3. api_key below (last resort)
+# api_key = "sk-ant-..."
+
+# Uncomment to use local vLLM / GLM instead:
+# provider = "openai-compatible"
+# base_url = "http://localhost:8000/v1"
+# model = "zai-org/GLM-4.7-Flash"
 
 [registry]
 url = "ghcr.io/epiphytic/girt-tools"

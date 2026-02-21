@@ -39,7 +39,7 @@ The GIRT design document describes five LLM personas that collaborate through st
 ```
 girt-plugin/
 ├── plugin.json                    # Plugin manifest
-├── .mcp.json                      # MCP server config (Wassette + GIRT proxy)
+├── .mcp.json                      # MCP server config (GIRT proxy with embedded runtime)
 ├── agents/
 │   ├── pipeline-lead.md           # Team lead: queue consumer + orchestrator
 │   ├── architect.md               # Spec refinement agent
@@ -132,7 +132,7 @@ Each request file contains the Operator's capability spec plus metadata:
 │         │       ▼                                          │
 │         │    ┌───────────┐                                 │
 │         │    │ Engineer  │ Writes code, compiles .wasm     │
-│         │    │ (Agent)   │ Loads into Wassette             │
+│         │    │ (Agent)   │ Loads into girt-runtime         │
 │         │    └─────┬─────┘                                 │
 │         │          │                                       │
 │         ├──► TaskCreate: "QA: test component"              │
@@ -196,7 +196,7 @@ The Pipeline Lead does NOT participate in spec refinement, code generation, test
 
 **How the Operator gets notified:**
 
-The Pipeline Lead calls Wassette's `load-component` to register the new tool, then the GIRT MCP proxy sends `tools/list_changed` to the Operator's MCP session. The Operator's tool list updates without restart.
+The Pipeline Lead triggers `girt-runtime`'s `LifecycleManager::load_component()` to register the new `.wasm` artifact in-process, then the GIRT MCP proxy sends `tools/list_changed` to the Operator's MCP session. The Operator's tool list updates without restart.
 
 ## Consequences
 
@@ -220,10 +220,23 @@ The Pipeline Lead calls Wassette's `load-component` to register the new tool, th
 If throughput or cost becomes a concern, the pipeline can be migrated to a Rust orchestrator that makes direct API calls to Claude (via the Anthropic SDK) while preserving:
 - The same agent system prompts (used as API system messages)
 - The same queue format (file-based, same JSON schema)
-- The same Wassette integration (MCP client calls)
+- The same girt-runtime integration (direct `LifecycleManager` calls)
 - The same hookwise decision engine (Rust library)
 
 The plugin layer would then become a thin CLI/UI wrapper over the Rust orchestrator, rather than the orchestrator itself. The agent definitions serve as the specification regardless of which runtime executes them.
+
+## Amendment — 2026-02-20: OAuth Credential Handling
+
+When GIRT makes direct Anthropic API calls (both current `AnthropicLlmClient` and the future Rust orchestrator path described above), credentials are resolved from:
+
+1. `ANTHROPIC_API_KEY` env var
+2. OpenClaw `auth-profiles.json` (reads the token GIRT's host agent is already using)
+3. GIRT's own OAuth token store (`~/.config/girt/auth.json`)
+4. `api_key` in `girt.toml`
+
+For case 3, GIRT uses the [`anthropic-auth`](https://docs.rs/anthropic-auth/latest) crate (v0.1, MIT) which implements the full Anthropic OAuth 2.0 PKCE flow (Max subscription or Console API-key-creation mode). This powers a `girt auth login` CLI command and provides automatic token refresh. Token storage is handled by GIRT via `AnthropicOAuthStore` in `girt-secrets`; `anthropic-auth` deliberately does not persist tokens itself.
+
+---
 
 ## Open Questions
 

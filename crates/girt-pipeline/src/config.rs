@@ -4,7 +4,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 
 use crate::error::PipelineError;
-use crate::llm::{LlmClient, OpenAiCompatibleClient, StubLlmClient};
+use crate::llm::{AnthropicLlmClient, LlmClient, OpenAiCompatibleClient, StubLlmClient};
 
 #[derive(Debug, Deserialize)]
 pub struct GirtConfig {
@@ -39,6 +39,8 @@ fn default_max_tokens() -> u32 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub enum LlmProvider {
+    #[serde(rename = "anthropic")]
+    Anthropic,
     #[serde(rename = "openai-compatible")]
     OpenAiCompatible,
     #[serde(rename = "stub")]
@@ -79,19 +81,27 @@ impl GirtConfig {
         })
     }
 
-    pub fn build_llm_client(&self) -> Arc<dyn LlmClient> {
+    pub fn build_llm_client(&self) -> Result<Arc<dyn LlmClient>, PipelineError> {
         match self.llm.provider {
+            LlmProvider::Anthropic => {
+                // from_env_or checks: ANTHROPIC_API_KEY → openclaw auth-profiles → api_key in toml
+                let client = AnthropicLlmClient::from_env_or(
+                    self.llm.model.clone(),
+                    self.llm.api_key.clone(),
+                )?;
+                Ok(Arc::new(client))
+            }
             LlmProvider::OpenAiCompatible => {
                 let api_key = std::env::var("GIRT_LLM_API_KEY")
                     .ok()
                     .or_else(|| self.llm.api_key.clone());
-                Arc::new(OpenAiCompatibleClient::new(
+                Ok(Arc::new(OpenAiCompatibleClient::new(
                     self.llm.base_url.clone(),
                     self.llm.model.clone(),
                     api_key,
-                ))
+                )))
             }
-            LlmProvider::Stub => Arc::new(StubLlmClient::constant("stub response")),
+            LlmProvider::Stub => Ok(Arc::new(StubLlmClient::constant("stub response"))),
         }
     }
 }
@@ -123,6 +133,57 @@ provider = "stub"
 "#;
         let config: GirtConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.llm.provider, LlmProvider::Stub);
+    }
+
+    #[test]
+    fn parses_anthropic_provider() {
+        let toml_str = r#"
+[llm]
+provider = "anthropic"
+model = "claude-sonnet-4-5"
+api_key = "sk-ant-test"
+"#;
+        let config: GirtConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.llm.provider, LlmProvider::Anthropic);
+        assert_eq!(config.llm.model, "claude-sonnet-4-5");
+    }
+
+    #[test]
+    fn build_llm_client_stub_succeeds() {
+        let toml_str = r#"[llm]
+provider = "stub"
+"#;
+        let config: GirtConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.build_llm_client().is_ok());
+    }
+
+    #[test]
+    fn build_llm_client_anthropic_with_inline_key_succeeds() {
+        // An api_key in girt.toml is the last-resort fallback.
+        // This always works regardless of env or openclaw config.
+        let toml_str = r#"[llm]
+provider = "anthropic"
+model = "claude-sonnet-4-5"
+api_key = "sk-ant-test-key"
+"#;
+        let config: GirtConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.build_llm_client().is_ok());
+    }
+
+    #[test]
+    fn build_llm_client_anthropic_resolution_order() {
+        // Credential resolution: ANTHROPIC_API_KEY > openclaw auth-profiles > api_key in toml.
+        // If an explicit key is in toml it always wins as a final fallback.
+        // We can't reliably test the "no credentials anywhere" case in CI
+        // because a developer machine may have openclaw configured.
+        let toml_str = r#"[llm]
+provider = "anthropic"
+model = "claude-sonnet-4-5"
+api_key = "sk-ant-fallback"
+"#;
+        let config: GirtConfig = toml::from_str(toml_str).unwrap();
+        // Should succeed via api_key fallback even with no env var
+        assert!(config.build_llm_client().is_ok());
     }
 
     #[test]

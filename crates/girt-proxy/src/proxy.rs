@@ -7,8 +7,9 @@ use girt_pipeline::llm::LlmClient;
 use girt_pipeline::orchestrator::{Orchestrator, PipelineOutcome};
 use girt_pipeline::publish::Publisher;
 use girt_pipeline::types::{CapabilityRequest, RequestSource};
+use girt_runtime::{ComponentMeta, LifecycleManager};
 use rmcp::{
-    ErrorData as McpError, Peer, RoleClient, RoleServer, ServerHandler,
+    ErrorData as McpError, Peer, RoleServer, ServerHandler,
     model::{
         CallToolRequestParams, CallToolResult, CompleteRequestParams, CompleteResult, Content,
         GetPromptRequestParams, GetPromptResult, InitializeRequestParams, InitializeResult,
@@ -20,46 +21,45 @@ use rmcp::{
 };
 use tokio::sync::Mutex;
 
-/// MCP proxy that routes agent requests through decision gates to Wassette.
-///
-/// Phase 1: Intercepts call_tool through Execution Gate, provides
-/// request_capability tool through Creation Gate.
-///
-/// Phase 2: When Creation Gate allows, triggers the build pipeline
-/// (Architect -> Engineer -> QA -> Red Team) and publishes the result.
+/// MCP proxy that routes agent requests through the Hookwise decision engine
+/// and executes approved tool calls via the embedded girt-runtime (ADR-010).
 pub struct GirtProxy {
-    wassette: Peer<RoleClient>,
-    wassette_capabilities: ServerCapabilities,
     engine: Arc<DecisionEngine>,
     llm: Arc<dyn LlmClient>,
     publisher: Arc<Publisher>,
-    /// Server peer for sending notifications (set during handler calls).
+    runtime: Arc<LifecycleManager>,
+    /// Server peer for sending tools/list_changed notifications.
     server_peer: Arc<Mutex<Option<Peer<RoleServer>>>>,
 }
 
 impl GirtProxy {
     pub fn new(
-        wassette: Peer<RoleClient>,
-        wassette_init: InitializeResult,
         engine: Arc<DecisionEngine>,
         llm: Arc<dyn LlmClient>,
         publisher: Arc<Publisher>,
+        runtime: Arc<LifecycleManager>,
     ) -> Self {
         Self {
-            wassette,
-            wassette_capabilities: wassette_init.capabilities,
             engine,
             llm,
             publisher,
+            runtime,
             server_peer: Arc::new(Mutex::new(None)),
         }
     }
 }
 
-fn girt_info(capabilities: &ServerCapabilities) -> InitializeResult {
+fn girt_capabilities() -> ServerCapabilities {
+    ServerCapabilities {
+        tools: Some(Default::default()),
+        ..Default::default()
+    }
+}
+
+fn girt_info() -> InitializeResult {
     InitializeResult {
         protocol_version: Default::default(),
-        capabilities: capabilities.clone(),
+        capabilities: girt_capabilities(),
         server_info: rmcp::model::Implementation::from_build_env(),
         instructions: Some("GIRT MCP Proxy -- Generative Isolated Runtime for Tools".into()),
     }
@@ -142,6 +142,26 @@ fn decision_to_content(decision: &Decision) -> Vec<Content> {
     vec![Content::text(json.to_string())]
 }
 
+/// Convert girt-runtime component metadata to an MCP Tool definition.
+fn component_meta_to_tool(meta: &ComponentMeta) -> Tool {
+    Tool {
+        name: meta.tool_name.clone().into(),
+        title: None,
+        description: Some(meta.description.clone().into()),
+        input_schema: meta
+            .input_schema
+            .as_object()
+            .cloned()
+            .unwrap_or_default()
+            .into(),
+        output_schema: None,
+        annotations: None,
+        execution: None,
+        icons: None,
+        meta: None,
+    }
+}
+
 fn make_tool_result(content: Vec<Content>, is_error: bool) -> CallToolResult {
     CallToolResult {
         content,
@@ -160,7 +180,7 @@ impl ServerHandler for GirtProxy {
         // Capture the server peer for later notifications
         let mut peer_lock = self.server_peer.lock().await;
         *peer_lock = Some(context.peer.clone());
-        Ok(girt_info(&self.wassette_capabilities))
+        Ok(girt_info())
     }
 
     async fn list_tools(
@@ -168,45 +188,16 @@ impl ServerHandler for GirtProxy {
         request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        tracing::debug!("Proxying list_tools");
+        tracing::debug!("Listing tools");
 
-        // Get tools from Wassette
-        let mut result = self
-            .wassette
-            .list_tools(request)
-            .await
-            .map_err(|e| McpError::internal_error(format!("Wassette error: {e}"), None))?;
+        let mut tools = vec![request_capability_tool()];
 
-        // Add GIRT's own tools
-        result.tools.push(request_capability_tool());
-
-        // Add cached tools (built by pipeline)
-        if let Ok(cached_names) = self.publisher.cache().list().await {
-            for name in cached_names {
-                if let Ok(Some(artifact)) = self.publisher.cache().get(&name).await {
-                    let tool = Tool {
-                        name: artifact.spec.name.into(),
-                        title: None,
-                        description: Some(artifact.spec.description.into()),
-                        input_schema: artifact
-                            .spec
-                            .inputs
-                            .as_object()
-                            .cloned()
-                            .unwrap_or_default()
-                            .into(),
-                        output_schema: None,
-                        annotations: None,
-                        execution: None,
-                        icons: None,
-                        meta: None,
-                    };
-                    result.tools.push(tool);
-                }
-            }
+        // Live tools from girt-runtime (built by pipeline, persisted across restarts)
+        for meta in self.runtime.list_tools().await {
+            tools.push(component_meta_to_tool(&meta));
         }
 
-        Ok(result)
+        Ok(ListToolsResult { tools, next_cursor: None, meta: None })
     }
 
     async fn call_tool(
@@ -248,11 +239,34 @@ impl ServerHandler for GirtProxy {
 
         match &gate_result.decision {
             Decision::Allow => {
-                tracing::info!(tool = %tool_name, "Proxying allowed call_tool to Wassette");
-                self.wassette
-                    .call_tool(request)
-                    .await
-                    .map_err(|e| McpError::internal_error(format!("Wassette error: {e}"), None))
+                tracing::info!(tool = %tool_name, "Execution Gate passed — invoking via girt-runtime");
+
+                let args = request
+                    .arguments
+                    .as_ref()
+                    .map(|a| serde_json::to_value(a).unwrap_or(serde_json::Value::Null))
+                    .unwrap_or(serde_json::Value::Null);
+
+                match self.runtime.call_tool(tool_name, &args).await {
+                    Ok(result) => Ok(make_tool_result(
+                        vec![Content::text(result.to_string())],
+                        false,
+                    )),
+                    Err(girt_runtime::RuntimeError::ToolError(msg)) => {
+                        tracing::warn!(tool = %tool_name, error = %msg, "Tool returned error");
+                        Ok(make_tool_result(vec![Content::text(msg)], true))
+                    }
+                    Err(girt_runtime::RuntimeError::ToolNotFound(_)) => {
+                        Err(McpError::invalid_request(
+                            format!("Tool '{tool_name}' not found in girt-runtime"),
+                            None,
+                        ))
+                    }
+                    Err(e) => {
+                        tracing::error!(tool = %tool_name, error = %e, "girt-runtime invocation failed");
+                        Err(McpError::internal_error(format!("Runtime error: {e}"), None))
+                    }
+                }
             }
             Decision::Deny { .. } => {
                 tracing::warn!(tool = %tool_name, "Tool call denied");
@@ -270,78 +284,54 @@ impl ServerHandler for GirtProxy {
 
     async fn list_resources(
         &self,
-        request: Option<PaginatedRequestParams>,
+        _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
-        tracing::debug!("Proxying list_resources");
-        self.wassette
-            .list_resources(request)
-            .await
-            .map_err(|e| McpError::internal_error(format!("Wassette error: {e}"), None))
+        Ok(ListResourcesResult { resources: vec![], next_cursor: None, meta: None })
     }
 
     async fn read_resource(
         &self,
-        request: ReadResourceRequestParams,
+        _request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, McpError> {
-        tracing::debug!("Proxying read_resource");
-        self.wassette
-            .read_resource(request)
-            .await
-            .map_err(|e| McpError::internal_error(format!("Wassette error: {e}"), None))
+        Err(McpError::invalid_request("No resources available", None))
     }
 
     async fn list_prompts(
         &self,
-        request: Option<PaginatedRequestParams>,
+        _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListPromptsResult, McpError> {
-        tracing::debug!("Proxying list_prompts");
-        self.wassette
-            .list_prompts(request)
-            .await
-            .map_err(|e| McpError::internal_error(format!("Wassette error: {e}"), None))
+        Ok(ListPromptsResult { prompts: vec![], next_cursor: None, meta: None })
     }
 
     async fn get_prompt(
         &self,
-        request: GetPromptRequestParams,
+        _request: GetPromptRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<GetPromptResult, McpError> {
-        tracing::debug!("Proxying get_prompt");
-        self.wassette
-            .get_prompt(request)
-            .await
-            .map_err(|e| McpError::internal_error(format!("Wassette error: {e}"), None))
+        Err(McpError::invalid_request("No prompts available", None))
     }
 
     async fn list_resource_templates(
         &self,
-        request: Option<PaginatedRequestParams>,
+        _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourceTemplatesResult, McpError> {
-        tracing::debug!("Proxying list_resource_templates");
-        self.wassette
-            .list_resource_templates(request)
-            .await
-            .map_err(|e| McpError::internal_error(format!("Wassette error: {e}"), None))
+        Ok(ListResourceTemplatesResult { resource_templates: vec![], next_cursor: None, meta: None })
     }
 
     async fn complete(
         &self,
-        request: CompleteRequestParams,
+        _request: CompleteRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<CompleteResult, McpError> {
-        tracing::debug!("Proxying complete");
-        self.wassette
-            .complete(request)
-            .await
-            .map_err(|e| McpError::internal_error(format!("Wassette error: {e}"), None))
+        Err(McpError::invalid_request("Completion not supported", None))
     }
 
     fn get_info(&self) -> ServerInfo {
-        let result = girt_info(&self.wassette_capabilities);
+        let result = girt_info();
         ServerInfo {
             protocol_version: result.protocol_version,
             capabilities: result.capabilities,
@@ -424,40 +414,81 @@ impl GirtProxy {
                 tracing::info!(
                     tool = %tool_name,
                     iterations = artifact.build_iterations,
-                    "Build pipeline succeeded"
+                    "Build pipeline succeeded — compiling WASM"
                 );
 
-                // Publish to local cache
-                match self.publisher.publish(&artifact).await {
-                    Ok(result) => {
+                // Compile source → .wasm
+                let compile_input = girt_pipeline::compiler::CompileInput {
+                    source_code: artifact.build_output.source_code.clone(),
+                    wit_definition: String::new(), // uses default girt-tool world
+                    tool_name: artifact.spec.name.clone(),
+                    tool_version: "0.1.0".into(),
+                };
+                let compiler = girt_pipeline::compiler::WasmCompiler::new();
+
+                match compiler.compile(&compile_input).await {
+                    Ok(compiled) => {
                         tracing::info!(
-                            tool = %result.tool_name,
-                            path = %result.local_path.display(),
-                            "Tool published"
+                            tool = %tool_name,
+                            wasm = %compiled.wasm_path.display(),
+                            "Compilation succeeded"
                         );
 
-                        // Send tools/list_changed notification
-                        self.notify_tools_changed().await;
+                        // Publish with wasm
+                        let publish_result = match self
+                            .publisher
+                            .publish_with_wasm(&artifact, &compiled.wasm_path)
+                            .await
+                        {
+                            Ok(r) => r,
+                            Err(e) => {
+                                tracing::error!(error = %e, "Failed to publish artifact");
+                                return Ok(make_tool_result(
+                                    vec![Content::text(format!(
+                                        r#"{{"status":"publish_failed","error":"{e}"}}"#
+                                    ))],
+                                    true,
+                                ));
+                            }
+                        };
+
+                        // Load into girt-runtime
+                        let wasm_path = publish_result.local_path.join("tool.wasm");
+                        let meta = girt_runtime::ComponentMeta {
+                            component_id: format!("{}@0.1.0", artifact.spec.name),
+                            tool_name: artifact.spec.name.clone(),
+                            description: artifact.spec.description.clone(),
+                            input_schema: artifact.spec.inputs.clone(),
+                            wasm_hash: String::new(), // computed by storage
+                            built_at: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as u64)
+                                .unwrap_or(0),
+                        };
+
+                        if let Err(e) = self.runtime.load_component(&wasm_path, meta).await {
+                            tracing::error!(error = %e, tool = %tool_name, "Failed to load component into runtime");
+                        } else {
+                            // Notify agent that tool list changed
+                            self.notify_tools_changed().await;
+                        }
 
                         let response = serde_json::json!({
                             "status": "built",
-                            "tool_name": result.tool_name,
+                            "tool_name": publish_result.tool_name,
                             "build_iterations": artifact.build_iterations,
                             "tests_run": artifact.qa_result.tests_run,
                             "tests_passed": artifact.qa_result.tests_passed,
                             "exploits_attempted": artifact.security_result.exploits_attempted,
                             "exploits_succeeded": artifact.security_result.exploits_succeeded,
                         });
-                        Ok(make_tool_result(
-                            vec![Content::text(response.to_string())],
-                            false,
-                        ))
+                        Ok(make_tool_result(vec![Content::text(response.to_string())], false))
                     }
                     Err(e) => {
-                        tracing::error!(error = %e, "Failed to publish artifact");
+                        tracing::error!(tool = %tool_name, error = %e, "WASM compilation failed");
                         Ok(make_tool_result(
                             vec![Content::text(format!(
-                                "{{\"status\": \"publish_failed\", \"error\": \"{e}\"}}"
+                                r#"{{"status":"compile_failed","tool_name":"{tool_name}","error":"{e}"}}"#
                             ))],
                             true,
                         ))

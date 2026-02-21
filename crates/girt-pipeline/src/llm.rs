@@ -117,6 +117,171 @@ impl LlmClient for OpenAiCompatibleClient {
     }
 }
 
+/// Read the Anthropic token from OpenClaw's auth-profiles.json.
+///
+/// Checks `$OPENCLAW_STATE_DIR` first, then `~/.openclaw`.
+/// Returns `None` silently if the file doesn't exist or can't be parsed —
+/// the caller will try the next fallback.
+fn openclaw_anthropic_token() -> Option<String> {
+    let state_dir = std::env::var("OPENCLAW_STATE_DIR")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".openclaw")))?;
+
+    let profiles_path = state_dir
+        .join("agents")
+        .join("main")
+        .join("agent")
+        .join("auth-profiles.json");
+
+    let content = std::fs::read_to_string(&profiles_path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+
+    // Walk: profiles -> "anthropic:default" -> token
+    // Also accept the first profile whose provider is "anthropic".
+    let profiles = json.get("profiles")?.as_object()?;
+
+    // Prefer the lastGood profile if specified
+    let preferred_key = json
+        .get("lastGood")
+        .and_then(|lg| lg.get("anthropic"))
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| "anthropic:default".into());
+
+    let token = profiles
+        .get(&preferred_key)
+        .or_else(|| {
+            // Fall back to any anthropic profile
+            profiles
+                .values()
+                .find(|v| v.get("provider").and_then(|p| p.as_str()) == Some("anthropic"))
+        })
+        .and_then(|p| p.get("token"))
+        .and_then(|t| t.as_str())
+        .map(String::from)?;
+
+    tracing::debug!(
+        path = %profiles_path.display(),
+        "Loaded Anthropic token from OpenClaw auth-profiles"
+    );
+
+    Some(token)
+}
+
+/// Anthropic Messages API client.
+///
+/// Calls `POST /v1/messages` with the Claude model specified in config.
+/// Reads the API key from the `ANTHROPIC_API_KEY` env var or the value
+/// passed at construction time.
+pub struct AnthropicLlmClient {
+    http: reqwest::Client,
+    model: String,
+    api_key: String,
+}
+
+impl AnthropicLlmClient {
+    pub fn new(model: String, api_key: String) -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            model,
+            api_key,
+        }
+    }
+
+    /// Resolve the Anthropic token using the following priority:
+    ///
+    /// 1. `ANTHROPIC_API_KEY` environment variable
+    /// 2. OpenClaw auth-profiles.json (`~/.openclaw/agents/main/agent/auth-profiles.json`)
+    /// 3. `api_key` field in `girt.toml`
+    ///
+    /// This allows GIRT to reuse the same credentials OpenClaw is already
+    /// configured with (setup-token or API key), with no separate configuration.
+    pub fn from_env_or(model: String, api_key_fallback: Option<String>) -> Result<Self, PipelineError> {
+        let api_key = std::env::var("ANTHROPIC_API_KEY")
+            .ok()
+            .or_else(openclaw_anthropic_token)
+            .or(api_key_fallback)
+            .ok_or_else(|| {
+                PipelineError::LlmError(
+                    "Anthropic credentials not found. \
+                     Options: set ANTHROPIC_API_KEY, run `openclaw models auth setup-token --provider anthropic`, \
+                     or set api_key in girt.toml".into(),
+                )
+            })?;
+        Ok(Self::new(model, api_key))
+    }
+}
+
+impl LlmClient for AnthropicLlmClient {
+    fn chat<'a>(
+        &'a self,
+        request: &'a LlmRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<LlmResponse, PipelineError>> + Send + 'a>> {
+        Box::pin(async move {
+            let messages: Vec<serde_json::Value> = request
+                .messages
+                .iter()
+                .map(|m| serde_json::json!({"role": m.role, "content": m.content}))
+                .collect();
+
+            let body = serde_json::json!({
+                "model": self.model,
+                "max_tokens": request.max_tokens,
+                "system": request.system_prompt,
+                "messages": messages,
+            });
+
+            // OAuth tokens (sk-ant-oat...) use Authorization: Bearer.
+            // Standard API keys (sk-ant-api...) use x-api-key.
+            let mut req = self
+                .http
+                .post("https://api.anthropic.com/v1/messages")
+                .header("anthropic-version", "2023-06-01")
+                .header("content-type", "application/json");
+
+            req = if self.api_key.starts_with("sk-ant-oat") {
+                req.header("Authorization", format!("Bearer {}", self.api_key))
+            } else {
+                req.header("x-api-key", &self.api_key)
+            };
+
+            let resp = req
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| PipelineError::LlmError(format!("HTTP request failed: {e}")))?;
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(PipelineError::LlmError(format!(
+                    "Anthropic API returned {status}: {body}"
+                )));
+            }
+
+            let json: serde_json::Value = resp
+                .json()
+                .await
+                .map_err(|e| PipelineError::LlmError(format!("Failed to parse response: {e}")))?;
+
+            let content = json["content"]
+                .as_array()
+                .and_then(|arr| arr.first())
+                .and_then(|block| block["text"].as_str())
+                .ok_or_else(|| {
+                    PipelineError::LlmError(format!(
+                        "Unexpected Anthropic response shape: {}",
+                        serde_json::to_string_pretty(&json).unwrap_or_default()
+                    ))
+                })?
+                .to_string();
+
+            Ok(LlmResponse { content })
+        })
+    }
+}
+
 /// Stub LLM client that returns deterministic responses for testing.
 pub struct StubLlmClient {
     responses: Vec<String>,

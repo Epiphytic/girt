@@ -1,0 +1,17 @@
+// GIRT standard tool interface.
+//
+// All tools built by the GIRT pipeline must implement this world.
+// The `run` export accepts JSON-encoded arguments and returns a JSON-encoded
+// result or a human-readable error string.
+//
+// This intentionally stays simple: typed WIT interfaces (per-parameter
+// schemas) are a future enhancement. JSON-string I/O avoids the type-
+// conversion complexity while still allowing arbitrarily rich tool APIs.
+
+package girt:tool;
+
+world girt-tool {
+    import wasi:http/outgoing-handler@0.2.0;
+
+    export run: func(input: string) -> result<string, string>;
+}

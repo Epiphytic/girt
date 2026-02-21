@@ -2,7 +2,7 @@ use crate::error::PipelineError;
 use crate::llm::{LlmClient, LlmMessage, LlmRequest};
 use crate::types::{BugTicket, BuildOutput, PolicyYaml, RefinedSpec, TargetLanguage};
 
-const ENGINEER_RUST_PROMPT: &str = r#"You are a Senior Backend Engineer. You write functions that compile to wasm32-wasi Components and run inside a Wasmtime sandbox via Wassette.
+const ENGINEER_RUST_PROMPT: &str = r#"You are a Senior Backend Engineer. You write functions that compile to wasm32-wasi Components and run inside girt-runtime, a Wasmtime-based WASM sandbox.
 
 Target: Rust -> WebAssembly Component Model via cargo-component v0.21.
 
@@ -56,13 +56,13 @@ Output ONLY valid JSON in this exact format:
 {
   "source_code": "// Full Rust source code using the bindings pattern shown above",
   "wit_definition": "package girt:tool;\n\nworld girt-tool {\n    export run: func(input: string) -> result<string, string>;\n}",
-  "policy_yaml": "// Wassette policy YAML here",
+  "policy_yaml": "// girt-runtime network policy (list allowed hosts, e.g. '- example.com')",
   "language": "rust"
 }
 
 Do not include any text outside the JSON object. Do not use markdown code fences."#;
 
-const ENGINEER_GO_PROMPT: &str = r#"You are a Senior Backend Engineer. You write functions that compile to wasm32-wasi Components using TinyGo and run inside a Wasmtime sandbox via Wassette.
+const ENGINEER_GO_PROMPT: &str = r#"You are a Senior Backend Engineer. You write functions that compile to wasm32-wasi Components using TinyGo and run inside girt-runtime, a Wasmtime-based WASM sandbox.
 
 Target: Go (TinyGo) -> WebAssembly Component Model with WIT interface definitions.
 
@@ -82,13 +82,13 @@ Output ONLY valid JSON in this exact format:
 {
   "source_code": "// Full Go source code here",
   "wit_definition": "// WIT interface here",
-  "policy_yaml": "// Wassette policy YAML here",
+  "policy_yaml": "// girt-runtime network policy (list allowed hosts)",
   "language": "go"
 }
 
 Do not include any text outside the JSON object. Do not use markdown code fences."#;
 
-const ENGINEER_AS_PROMPT: &str = r#"You are a Senior Backend Engineer. You write functions that compile to wasm32-wasi Components using AssemblyScript and run inside a Wasmtime sandbox via Wassette.
+const ENGINEER_AS_PROMPT: &str = r#"You are a Senior Backend Engineer. You write functions that compile to wasm32-wasi Components using AssemblyScript and run inside girt-runtime, a Wasmtime-based WASM sandbox.
 
 Target: AssemblyScript -> WebAssembly Component Model with WIT interface definitions.
 
@@ -108,7 +108,7 @@ Output ONLY valid JSON in this exact format:
 {
   "source_code": "// Full AssemblyScript source code here",
   "wit_definition": "// WIT interface here",
-  "policy_yaml": "// Wassette policy YAML here",
+  "policy_yaml": "// girt-runtime network policy (list allowed hosts)",
   "language": "assemblyscript"
 }
 
@@ -120,7 +120,7 @@ Output ONLY the complete fixed code in the same JSON format as before:
 {
   "source_code": "// Fixed source code",
   "wit_definition": "// WIT interface (may be unchanged)",
-  "policy_yaml": "// Wassette policy YAML (may be unchanged)",
+  "policy_yaml": "// girt-runtime network policy (may be unchanged)",
   "language": "<same language as before>"
 }"#;
 

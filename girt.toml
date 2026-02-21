@@ -19,6 +19,13 @@ max_tokens = 4096
 # base_url = "http://localhost:8000/v1"
 # model = "zai-org/GLM-4.7-Flash"
 
+[pipeline]
+# Path to a coding standards / conventions file.
+# Its contents are injected into the Engineer agent's system prompt so
+# generated WASM components follow your project's coding style.
+# Supports ~ expansion. Leave commented to disable.
+coding_standards_path = "~/.openclaw/workspace/CLAUDE.md"
+
 [registry]
 url = "ghcr.io/epiphytic/girt-tools"
 

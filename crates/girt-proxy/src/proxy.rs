@@ -28,6 +28,8 @@ pub struct GirtProxy {
     llm: Arc<dyn LlmClient>,
     publisher: Arc<Publisher>,
     runtime: Arc<LifecycleManager>,
+    /// Coding standards injected into the Engineer's system prompt.
+    coding_standards: Option<String>,
     /// Server peer for sending tools/list_changed notifications.
     server_peer: Arc<Mutex<Option<Peer<RoleServer>>>>,
 }
@@ -38,12 +40,14 @@ impl GirtProxy {
         llm: Arc<dyn LlmClient>,
         publisher: Arc<Publisher>,
         runtime: Arc<LifecycleManager>,
+        coding_standards: Option<String>,
     ) -> Self {
         Self {
             engine,
             llm,
             publisher,
             runtime,
+            coding_standards,
             server_peer: Arc::new(Mutex::new(None)),
         }
     }
@@ -406,7 +410,8 @@ impl GirtProxy {
             "Triggering build pipeline"
         );
 
-        let orchestrator = Orchestrator::new(self.llm.as_ref());
+        let orchestrator = Orchestrator::new(self.llm.as_ref())
+            .with_standards(self.coding_standards.clone());
         let outcome = orchestrator.run(&cap_request).await;
 
         match outcome {

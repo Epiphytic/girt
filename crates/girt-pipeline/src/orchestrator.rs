@@ -27,17 +27,28 @@ pub enum PipelineOutcome {
 ///
 /// The orchestrator runs the full build pipeline for a capability request:
 /// 1. Architect refines the spec
-/// 2. Engineer generates code
+/// 2. Engineer generates code (with optional coding standards injected)
 /// 3. QA and Red Team validate in parallel (conceptually)
 /// 4. If bugs found, loop back to Engineer with fix directives (max 3 iterations)
 /// 5. Return the final artifact or failure
 pub struct Orchestrator<'a> {
     llm: &'a dyn LlmClient,
+    /// Optional coding standards to inject into the Engineer's system prompt.
+    coding_standards: Option<String>,
 }
 
 impl<'a> Orchestrator<'a> {
     pub fn new(llm: &'a dyn LlmClient) -> Self {
-        Self { llm }
+        Self {
+            llm,
+            coding_standards: None,
+        }
+    }
+
+    /// Attach coding standards to be passed to the Engineer agent.
+    pub fn with_standards(mut self, standards: Option<String>) -> Self {
+        self.coding_standards = standards;
+        self
     }
 
     /// Run the full pipeline for a capability request.
@@ -77,7 +88,8 @@ impl<'a> Orchestrator<'a> {
     }
 
     async fn build_loop(&self, spec: &RefinedSpec) -> Result<Box<BuildArtifact>, PipelineError> {
-        let engineer = EngineerAgent::new(self.llm);
+        let engineer = EngineerAgent::new(self.llm)
+            .with_standards(self.coding_standards.clone());
         let qa = QaAgent::new(self.llm);
         let red_team = RedTeamAgent::new(self.llm);
 

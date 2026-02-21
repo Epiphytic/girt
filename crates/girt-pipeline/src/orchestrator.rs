@@ -1,10 +1,14 @@
 use crate::agent::architect::ArchitectAgent;
 use crate::agent::engineer::EngineerAgent;
+use crate::agent::planner::PlannerAgent;
 use crate::agent::qa::QaAgent;
 use crate::agent::red_team::RedTeamAgent;
 use crate::error::PipelineError;
 use crate::llm::LlmClient;
-use crate::types::{BugTicket, BuildArtifact, CapabilityRequest, RefinedSpec, SpecAction};
+use crate::types::{
+    BugTicket, BuildArtifact, CapabilityRequest, ComplexityHint, ImplementationPlan, RefinedSpec,
+    SpecAction,
+};
 
 /// Default maximum build-fix iterations. Override via `pipeline.max_iterations` in girt.toml.
 const DEFAULT_MAX_ITERATIONS: u32 = 3;
@@ -79,8 +83,11 @@ impl<'a> Orchestrator<'a> {
             };
         }
 
+        // Phase 1.5: Planner (runs for complex specs before Engineer)
+        let plan = self.planner_phase(&refined).await;
+
         // Phase 2-4: Build loop with QA and Red Team validation
-        match self.build_loop(&refined).await {
+        match self.build_loop(&refined, plan).await {
             Ok(artifact) => PipelineOutcome::Built(artifact),
             Err(e) => PipelineOutcome::Failed(e),
         }
@@ -96,9 +103,39 @@ impl<'a> Orchestrator<'a> {
         Ok(refined)
     }
 
-    async fn build_loop(&self, spec: &RefinedSpec) -> Result<Box<BuildArtifact>, PipelineError> {
+    /// Run the Planner if the spec meets complexity triggers; return `None` on skip or failure.
+    async fn planner_phase(&self, spec: &RefinedSpec) -> Option<ImplementationPlan> {
+        if !needs_planner(spec) {
+            tracing::debug!(spec_name = %spec.spec.name, "Planner skipped (low complexity)");
+            return None;
+        }
+
+        tracing::info!(spec_name = %spec.spec.name, "Running Planner (complex spec detected)");
+        match PlannerAgent::new(self.llm).plan(spec).await {
+            Ok(plan) => {
+                tracing::info!(spec_name = %spec.spec.name, "Planner completed");
+                Some(plan)
+            }
+            Err(e) => {
+                // Non-fatal: log and let the Engineer proceed without a plan.
+                tracing::warn!(
+                    error = %e,
+                    spec_name = %spec.spec.name,
+                    "Planner failed; proceeding without implementation plan"
+                );
+                None
+            }
+        }
+    }
+
+    async fn build_loop(
+        &self,
+        spec: &RefinedSpec,
+        plan: Option<ImplementationPlan>,
+    ) -> Result<Box<BuildArtifact>, PipelineError> {
         let engineer = EngineerAgent::new(self.llm)
-            .with_standards(self.coding_standards.clone());
+            .with_standards(self.coding_standards.clone())
+            .with_plan(plan);
         let qa = QaAgent::new(self.llm);
         let red_team = RedTeamAgent::new(self.llm);
 
@@ -168,11 +205,59 @@ impl<'a> Orchestrator<'a> {
             };
         }
 
-        match self.build_loop(spec).await {
+        let plan = self.planner_phase(spec).await;
+        match self.build_loop(spec, plan).await {
             Ok(artifact) => PipelineOutcome::Built(artifact),
             Err(e) => PipelineOutcome::Failed(e),
         }
     }
+}
+
+/// Determine whether the Planner agent should run for this spec.
+///
+/// Triggers on structural signals (network calls, secrets, async/polling
+/// language in the description, multiple user-supplied string inputs) as well
+/// as an explicit `complexity_hint: "high"` from the Architect.
+fn needs_planner(spec: &RefinedSpec) -> bool {
+    // Explicit override from Architect
+    if spec.complexity_hint == Some(ComplexityHint::High) {
+        return true;
+    }
+
+    let constraints = &spec.spec.constraints;
+
+    // Any outbound network calls → potentially injection surfaces + error handling
+    if !constraints.network.is_empty() {
+        return true;
+    }
+
+    // Any secrets → credential hygiene required
+    if !constraints.secrets.is_empty() {
+        return true;
+    }
+
+    // Async/polling language → timing edge cases, loop termination
+    let desc = spec.spec.description.to_lowercase();
+    if desc.contains("poll") || desc.contains("wait") || desc.contains("timeout") {
+        return true;
+    }
+
+    // Multiple user-supplied string inputs → potential injection surfaces
+    if let Some(obj) = spec.spec.inputs.as_object() {
+        let string_inputs = obj
+            .values()
+            .filter(|v| {
+                v.as_str()
+                    .map(|s| s.to_lowercase().contains("string") || s.to_lowercase().contains("str"))
+                    .unwrap_or(false)
+            })
+            .count();
+        if string_inputs >= 2 {
+            return true;
+        }
+    }
+
+    false
 }
 
 fn format_ticket_summary(tickets: &[BugTicket]) -> String {
@@ -225,6 +310,7 @@ mod tests {
             design_notes: "test".into(),
             extend_target: None,
             extend_features: None,
+            complexity_hint: None,
         }
     }
 
@@ -482,6 +568,7 @@ mod tests {
             design_notes: "extend instead".into(),
             extend_target: Some("existing".into()),
             extend_features: Some(vec!["feat_a".into()]),
+            complexity_hint: None,
         };
 
         let client = StubLlmClient::constant("unused");

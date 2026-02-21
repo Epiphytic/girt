@@ -62,6 +62,10 @@ pub struct RefinedSpec {
     pub design_notes: String,
     pub extend_target: Option<String>,
     pub extend_features: Option<Vec<String>>,
+    /// Architect's explicit complexity signal. When `Some(High)`, the Orchestrator
+    /// runs the Planner before the Engineer regardless of structural triggers.
+    #[serde(default)]
+    pub complexity_hint: Option<ComplexityHint>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +73,35 @@ pub struct RefinedSpec {
 pub enum SpecAction {
     Build,
     RecommendExtend,
+}
+
+/// Complexity signal from the Architect. Determines whether the Planner runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComplexityHint {
+    Low,
+    High,
+}
+
+/// Structured implementation brief produced by the Planner agent.
+///
+/// The Engineer receives this alongside the refined spec. Following the plan
+/// is mandatory; deviations require an explanatory code comment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImplementationPlan {
+    /// All input validation that must occur before any external calls,
+    /// with exact constraints (max lengths, allowed char sets, etc.).
+    pub validation_layer: String,
+    /// Threat model: for each input field, what can an attacker do and
+    /// what mitigations are required (CRLF injection, path traversal, etc.).
+    pub security_notes: String,
+    /// Step-by-step API call sequence with error handling for each step.
+    pub api_sequence: String,
+    /// Identified edge cases and the required handling for each.
+    pub edge_cases: String,
+    /// Language-specific patterns, crate recommendations, and things to avoid
+    /// in WASM+WASI (e.g. std::thread, blocking I/O patterns).
+    pub implementation_guidance: String,
 }
 
 /// Supported build target languages.

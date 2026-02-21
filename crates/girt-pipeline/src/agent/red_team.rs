@@ -140,6 +140,7 @@ mod tests {
             design_notes: "test".into(),
             extend_target: None,
             extend_features: None,
+            complexity_hint: None,
         };
         let build = BuildOutput {
             source_code: "fn main() {}".into(),

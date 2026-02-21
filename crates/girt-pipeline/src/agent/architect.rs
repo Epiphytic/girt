@@ -38,8 +38,11 @@ Output ONLY valid JSON in this exact format:
       "secrets": []
     }
   },
+  "complexity_hint": "low",
   "design_notes": "What decisions you made on behalf of the caller and why"
 }
+
+complexity_hint must be "low" or "high". Set "high" when the tool: makes outbound HTTP calls, handles user-supplied secrets or credentials, involves polling/timing loops, or processes multiple user-supplied string inputs that could be injection surfaces. Set "low" for pure computation with no I/O.
 
 Do not include any text outside the JSON object."#;
 
@@ -100,6 +103,7 @@ impl<'a> ArchitectAgent<'a> {
             design_notes: "Unrefined spec (Architect unavailable)".into(),
             extend_target: None,
             extend_features: None,
+            complexity_hint: None,
         }
     }
 }

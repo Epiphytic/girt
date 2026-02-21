@@ -1,6 +1,6 @@
 use crate::error::PipelineError;
 use crate::llm::{LlmClient, LlmMessage, LlmRequest};
-use crate::types::{BugTicket, BuildOutput, PolicyYaml, RefinedSpec, TargetLanguage};
+use crate::types::{BugTicket, BuildOutput, ImplementationPlan, PolicyYaml, RefinedSpec, TargetLanguage};
 
 const ENGINEER_RUST_PROMPT: &str = r#"You are a Senior Backend Engineer. You write functions that compile to wasm32-wasi Components and run inside girt-runtime, a Wasmtime-based WASM sandbox.
 
@@ -134,6 +134,9 @@ pub struct EngineerAgent<'a> {
     coding_standards: Option<String>,
     /// Token budget for LLM responses. Complex WASM components need 8000+.
     max_tokens: u32,
+    /// Optional implementation plan from the Planner agent. When present,
+    /// injected into the build and fix prompts as the authoritative reference.
+    implementation_plan: Option<ImplementationPlan>,
 }
 
 impl<'a> EngineerAgent<'a> {
@@ -143,6 +146,7 @@ impl<'a> EngineerAgent<'a> {
             target: TargetLanguage::default(),
             coding_standards: None,
             max_tokens: 64000,
+            implementation_plan: None,
         }
     }
 
@@ -152,6 +156,7 @@ impl<'a> EngineerAgent<'a> {
             target,
             coding_standards: None,
             max_tokens: 64000,
+            implementation_plan: None,
         }
     }
 
@@ -164,6 +169,16 @@ impl<'a> EngineerAgent<'a> {
     /// Override the token budget (default: 8192).
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = max_tokens;
+        self
+    }
+
+    /// Attach an implementation plan from the Planner agent.
+    ///
+    /// When set, the plan is injected into every build and fix prompt as the
+    /// authoritative implementation reference. The Engineer must follow the
+    /// plan's validation strategy and API sequence.
+    pub fn with_plan(mut self, plan: Option<ImplementationPlan>) -> Self {
+        self.implementation_plan = plan;
         self
     }
 
@@ -197,16 +212,40 @@ impl<'a> EngineerAgent<'a> {
         }
     }
 
+    /// Format the implementation plan section for injection into prompts.
+    fn plan_section(&self) -> Option<String> {
+        self.implementation_plan.as_ref().map(|plan| {
+            format!(
+                "\n\nImplementation Plan (authoritative — follow exactly; note any deviation in a code comment):\n\
+                 Validation Layer: {}\n\
+                 Security Notes: {}\n\
+                 API Sequence: {}\n\
+                 Edge Cases: {}\n\
+                 Implementation Guidance: {}",
+                plan.validation_layer,
+                plan.security_notes,
+                plan.api_sequence,
+                plan.edge_cases,
+                plan.implementation_guidance,
+            )
+        })
+    }
+
     /// Generate initial code from a refined spec.
     pub async fn build(&self, spec: &RefinedSpec) -> Result<BuildOutput, PipelineError> {
         let spec_json = serde_json::to_string_pretty(spec)
             .map_err(|e| PipelineError::LlmError(format!("Failed to serialize spec: {e}")))?;
 
+        let plan_text = self.plan_section().unwrap_or_default();
+        let content = format!(
+            "Implement this tool spec as a WASM Component:{plan_text}\n\nSpec:\n{spec_json}"
+        );
+
         let request = LlmRequest {
             system_prompt: self.system_prompt(),
             messages: vec![LlmMessage {
                 role: "user".into(),
-                content: format!("Implement this tool spec as a WASM Component:\n\n{spec_json}"),
+                content,
             }],
             max_tokens: self.max_tokens,
         };
@@ -225,16 +264,19 @@ impl<'a> EngineerAgent<'a> {
         let ticket_json = serde_json::to_string_pretty(ticket)
             .map_err(|e| PipelineError::LlmError(format!("Failed to serialize ticket: {e}")))?;
 
+        let plan_text = self.plan_section().unwrap_or_default();
+        let content = format!(
+            "Original spec:\n{}{plan_text}\n\nPrevious code:\n{}\n\nBug ticket:\n{}",
+            serde_json::to_string_pretty(spec).unwrap_or_default(),
+            previous_output.source_code,
+            ticket_json,
+        );
+
         let request = LlmRequest {
             system_prompt: self.fix_prompt(),
             messages: vec![LlmMessage {
                 role: "user".into(),
-                content: format!(
-                    "Original spec:\n{}\n\nPrevious code:\n{}\n\nBug ticket:\n{}",
-                    serde_json::to_string_pretty(spec).unwrap_or_default(),
-                    previous_output.source_code,
-                    ticket_json,
-                ),
+                content,
             }],
             max_tokens: self.max_tokens,
         };
@@ -291,6 +333,7 @@ mod tests {
             design_notes: "Simple stateless conversion".into(),
             extend_target: None,
             extend_features: None,
+            complexity_hint: None,
         }
     }
 

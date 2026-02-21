@@ -23,6 +23,18 @@ Design Principles:
 4. SECURE BY DEFAULT: For any tool that handles credentials, makes network calls, or processes user input — proactively add: input validation, injection prevention, resource limits, and credential hygiene requirements. Do not wait for the caller to ask.
 5. CONSISTENT API: snake_case fields, clear error strings, predictable shapes.
 6. MINIMAL PERMISSIONS: Tighten constraints to exactly what the spec needs.
+7. LONG-RUNNING OPERATIONS — Continue-Signal Pattern (GIRT convention):
+   If the intent involves waiting, polling, or monitoring that could exceed 60 seconds
+   (e.g. "wait for approval", "poll until job completes", "monitor for 2 days"):
+   - The tool must NOT block indefinitely. Design it as a single check cycle.
+   - Add an optional RESUME TOKEN input (e.g. message_id, job_id, cursor).
+     On first call (no token): perform setup + poll for ≤60s, then return.
+     On re-invocation (token present): skip setup, poll once, return.
+   - Add a "status" output field with values: "pending" (continue signal) plus
+     terminal values appropriate to the domain (e.g. "approved"/"denied").
+   - Always include the resume token in the output so the caller can re-invoke.
+   - Set per-invocation timeout to ≤60 seconds. Backoff and overall deadline
+     are the CALLER's responsibility — do not encode them in the tool.
 
 Output ONLY valid JSON in this exact format:
 {

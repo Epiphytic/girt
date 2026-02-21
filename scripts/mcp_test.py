@@ -41,14 +41,14 @@ def main():
             "On re-invocation, pass message_id to skip posting and resume polling."
         ),
         "inputs": {
-            "question": "string — the question to ask (ignored on re-invocation if message_id given)",
-            "context": "string — optional context shown below the question",
-            "channel_id": "string — Discord channel snowflake (digits only)",
-            "guild_id": "string — Discord guild snowflake (digits only, for permalink)",
-            "bot_token": "string — Discord bot token; used exclusively in the Authorization header as 'Bot <token>'; must never appear in URLs, query params, error messages, or any output field",
-            "authorized_users": "array of strings — Discord usernames allowed to respond; empty means accept first respondent",
-            "timeout_secs": "number — seconds to poll before returning pending; minimum 10, maximum 60",
-            "message_id": "string — optional; if provided, skip posting and resume polling this existing message"
+            "question": "string — the question to post; required (non-empty, non-whitespace) when message_id is absent; optional (ignored) when message_id is provided",
+            "context": "string — optional context shown below the question; posted verbatim, so callers should be aware it reaches human approvers",
+            "channel_id": "string — Discord channel snowflake: must match /^[0-9]{1,20}$/; reject anything else",
+            "guild_id": "string — Discord guild snowflake: must match /^[0-9]{1,20}$/; reject anything else",
+            "bot_token": "string — Discord bot token; used exclusively as 'Bot <token>' in the Authorization header; must never appear in URLs, query params, error messages, log output, or any output field; error messages on HTTP failure must use generic text only (e.g. 'Discord API error: <status_code>'), never raw request details",
+            "authorized_users": "array of strings — Discord usernames allowed to respond; deduplicate before use; empty means accept the first respondent",
+            "timeout_secs": "number — seconds to poll before returning pending; 10 to 60 inclusive; reject values outside this range",
+            "message_id": "string — optional; when provided, skip posting and resume polling this existing message; question becomes optional"
         },
         "outputs": {
             "status": "string — 'approved', 'denied', or 'pending' (re-invoke with message_id to continue)",

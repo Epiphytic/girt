@@ -131,6 +131,16 @@ def main():
                 print(f"  build_iterations : {parsed.get('build_iterations')}", flush=True)
                 print(f"  tests            : {parsed.get('tests_passed')}/{parsed.get('tests_run')}", flush=True)
                 print(f"  exploits blocked : {parsed.get('exploits_attempted')} attempted, {parsed.get('exploits_succeeded')} succeeded", flush=True)
+                t = parsed.get("timings", {})
+                if t:
+                    iters = t.get("iterations", [])
+                    print(f"  ── stage timings ────────────────────────────", flush=True)
+                    print(f"  architect        : {t.get('architect_ms', 0)}ms", flush=True)
+                    planner = t.get("planner_ms")
+                    print(f"  planner          : {planner}ms" if planner else "  planner          : skipped", flush=True)
+                    for it in iters:
+                        print(f"  iter {it['iteration']}: engineer={it['engineer_ms']}ms  qa={it['qa_ms']}ms  red_team={it['red_team_ms']}ms", flush=True)
+                    print(f"  total            : {t.get('total_ms', 0)}ms", flush=True)
 
                 # verify new tool appears
                 send(proc, {"jsonrpc": "2.0", "id": 4, "method": "tools/list", "params": {}})

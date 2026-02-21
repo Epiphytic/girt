@@ -13,6 +13,17 @@ pub struct GirtConfig {
     pub registry: RegistryConfig,
     #[serde(default)]
     pub build: BuildConfig,
+    #[serde(default)]
+    pub pipeline: PipelineConfig,
+}
+
+/// Pipeline-level configuration.
+#[derive(Debug, Default, Deserialize)]
+pub struct PipelineConfig {
+    /// Path to a coding standards file (e.g. ~/.claude/CLAUDE.md).
+    /// When set, the contents are injected into the Engineer's system prompt
+    /// so generated code follows your project's conventions.
+    pub coding_standards_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -74,6 +85,33 @@ fn default_tier() -> String {
 }
 
 impl GirtConfig {
+    /// Load and return the coding standards content, if a path is configured.
+    ///
+    /// Expands `~` to the home directory. Returns `None` silently if the path
+    /// isn't set or the file doesn't exist (non-fatal — standards are optional).
+    pub fn load_coding_standards(&self) -> Option<String> {
+        let raw = self.pipeline.coding_standards_path.as_deref()?;
+        let expanded = if raw.starts_with('~') {
+            dirs::home_dir()?.join(&raw[2..])
+        } else {
+            std::path::PathBuf::from(raw)
+        };
+        match std::fs::read_to_string(&expanded) {
+            Ok(content) => {
+                tracing::info!(path = %expanded.display(), "Loaded coding standards");
+                Some(content)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %expanded.display(),
+                    error = %e,
+                    "Could not load coding standards — continuing without them"
+                );
+                None
+            }
+        }
+    }
+
     pub fn from_file(path: &Path) -> Result<Self, PipelineError> {
         let content = std::fs::read_to_string(path).map_err(PipelineError::IoError)?;
         toml::from_str(&content).map_err(|e| {

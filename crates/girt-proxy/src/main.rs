@@ -112,6 +112,9 @@ async fn run_serve(config_flag: Option<PathBuf>) -> Result<()> {
         .context("Failed to initialize LLM client")?;
     tracing::info!("LLM client initialized");
 
+    // Load optional coding standards (injected into Engineer's system prompt)
+    let coding_standards = config.load_coding_standards();
+
     // Initialize the Hookwise decision engine with real LLM evaluators.
     // Both gates share the same underlying client via Arc.
     let engine = Arc::new(DecisionEngine::with_real_llm(
@@ -135,7 +138,7 @@ async fn run_serve(config_flag: Option<PathBuf>) -> Result<()> {
     tracing::info!("girt-runtime initialized");
 
     // Create proxy handler
-    let proxy = GirtProxy::new(engine, llm, publisher, runtime);
+    let proxy = GirtProxy::new(engine, llm, publisher, runtime, coding_standards);
 
     // Serve on stdio (agent connects here)
     let stdio = rmcp::transport::io::stdio();

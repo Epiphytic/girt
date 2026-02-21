@@ -129,6 +129,9 @@ Output ONLY the complete fixed code in the same JSON format as before:
 pub struct EngineerAgent<'a> {
     llm: &'a dyn LlmClient,
     target: TargetLanguage,
+    /// Optional coding standards injected into every system prompt.
+    /// Loaded from `pipeline.coding_standards_path` in girt.toml.
+    coding_standards: Option<String>,
 }
 
 impl<'a> EngineerAgent<'a> {
@@ -136,19 +139,51 @@ impl<'a> EngineerAgent<'a> {
         Self {
             llm,
             target: TargetLanguage::default(),
+            coding_standards: None,
         }
     }
 
     pub fn with_target(llm: &'a dyn LlmClient, target: TargetLanguage) -> Self {
-        Self { llm, target }
+        Self {
+            llm,
+            target,
+            coding_standards: None,
+        }
     }
 
-    /// Get the system prompt for the configured target language.
-    fn system_prompt(&self) -> &'static str {
-        match self.target {
+    /// Attach coding standards to be injected into the system prompt.
+    pub fn with_standards(mut self, standards: Option<String>) -> Self {
+        self.coding_standards = standards;
+        self
+    }
+
+    /// Build the full system prompt for the current target, optionally appending
+    /// coding standards so the Engineer follows the project's conventions.
+    fn system_prompt(&self) -> String {
+        let base = match self.target {
             TargetLanguage::Rust => ENGINEER_RUST_PROMPT,
             TargetLanguage::Go => ENGINEER_GO_PROMPT,
             TargetLanguage::AssemblyScript => ENGINEER_AS_PROMPT,
+        };
+        match &self.coding_standards {
+            Some(standards) => format!(
+                "{base}\n\n## Project Coding Standards\n\
+                 The following standards apply to all code you write. Follow them:\n\n\
+                 {standards}"
+            ),
+            None => base.to_string(),
+        }
+    }
+
+    /// Build the fix system prompt, also injecting coding standards if present.
+    fn fix_prompt(&self) -> String {
+        match &self.coding_standards {
+            Some(standards) => format!(
+                "{ENGINEER_FIX_PROMPT}\n\n## Project Coding Standards\n\
+                 The following standards apply. Follow them:\n\n\
+                 {standards}"
+            ),
+            None => ENGINEER_FIX_PROMPT.to_string(),
         }
     }
 
@@ -158,7 +193,7 @@ impl<'a> EngineerAgent<'a> {
             .map_err(|e| PipelineError::LlmError(format!("Failed to serialize spec: {e}")))?;
 
         let request = LlmRequest {
-            system_prompt: self.system_prompt().into(),
+            system_prompt: self.system_prompt(),
             messages: vec![LlmMessage {
                 role: "user".into(),
                 content: format!("Implement this tool spec as a WASM Component:\n\n{spec_json}"),
@@ -181,7 +216,7 @@ impl<'a> EngineerAgent<'a> {
             .map_err(|e| PipelineError::LlmError(format!("Failed to serialize ticket: {e}")))?;
 
         let request = LlmRequest {
-            system_prompt: ENGINEER_FIX_PROMPT.into(),
+            system_prompt: self.fix_prompt(),
             messages: vec![LlmMessage {
                 role: "user".into(),
                 content: format!(

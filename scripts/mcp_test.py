@@ -41,9 +41,9 @@ def main():
             "context": "string — additional context for the approver",
             "channel_id": "string — Discord channel to post to",
             "guild_id": "string — Discord guild (for the message permalink)",
-            "bot_token": "string — Discord bot token",
+            "bot_token": "string — Discord bot token; used exclusively in the Authorization header as 'Bot <token>'; must never appear in URLs, query params, error messages, or any output field",
             "authorized_users": "array of strings — usernames who may respond (empty = anyone)",
-            "timeout_secs": "number — seconds to wait before auto-deny"
+            "timeout_secs": "number — seconds to wait before auto-deny; minimum 30, maximum 300"
         },
         "outputs": {
             "approved": "bool",
@@ -113,7 +113,7 @@ def main():
             "params": {"name": "request_capability", "arguments": spec},
         })
 
-        resp = recv(timeout=360)
+        resp = recv(timeout=720)
         elapsed = time.time() - t0
 
         content = resp.get("result", {}).get("content", [{}])

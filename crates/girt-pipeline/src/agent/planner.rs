@@ -18,6 +18,17 @@ Think through each of the following areas carefully:
    Cover: CRLF/header injection (for HTTP-touching fields), path traversal (for fields used in URLs), resource exhaustion (unbounded loops, missing timeouts, oversized payloads), identity spoofing (username vs user ID), prompt injection (if any field ends up in LLM context).
    State the specific mitigation for each threat.
 
+   CREDENTIAL FIELDS (any field containing tokens, passwords, API keys):
+   - State exactly which HTTP header the credential goes into (e.g. "Authorization: Bot <token>")
+   - List every place the credential must NOT appear: error messages, log output, response fields, URL paths, query parameters, request bodies other than the specified header
+   - Specify what error text to use when auth fails ("authentication failed" — never include the token value)
+   - Note whether the credential needs sanitization before header use (e.g. strip CRLF)
+
+   RESOURCE EXHAUSTION (timeouts, loops, payload sizes):
+   - For polling loops: state the maximum wall-clock time the component should run
+   - For timeout inputs: if the caller-supplied value seems high (>300s), flag it as a resource exhaustion risk and recommend a lower cap
+   - For payload sizes: state max bytes to read from any single HTTP response
+
 3. API SEQUENCE
    List every external call in order. For each:
    - Exact endpoint and HTTP method

@@ -53,6 +53,9 @@ max_iterations = 3
 on_circuit_breaker = "proceed"
 
 [registry]
+# Source repository for syncing built tool code (optional)
+source_repo = "https://github.com/Epiphytic/girt-tools"
+# local_path defaults to ~/.girt/tool-registry
 url = "ghcr.io/epiphytic/girt-tools"
 
 [build]

@@ -8,6 +8,7 @@ use girt_pipeline::orchestrator::{Orchestrator, PipelineOutcome};
 use girt_pipeline::publish::Publisher;
 use girt_pipeline::types::{CapabilityRequest, RequestSource};
 use girt_runtime::{ComponentMeta, LifecycleManager};
+use crate::approval::ApprovalManager;
 use rmcp::{
     ErrorData as McpError, Peer, RoleServer, ServerHandler,
     model::{
@@ -36,11 +37,16 @@ pub struct GirtProxy {
     circuit_breaker_policy: girt_pipeline::config::CircuitBreakerPolicy,
     /// Path to the cargo-component binary.
     cargo_component_bin: String,
+    /// Human-in-the-loop approval manager (drives discord_approval WASM).
+    /// When present, `Ask` decisions from the Creation Gate are routed here
+    /// instead of being surfaced to the MCP caller.
+    approval_manager: Option<Arc<ApprovalManager>>,
     /// Server peer for sending tools/list_changed notifications.
     server_peer: Arc<Mutex<Option<Peer<RoleServer>>>>,
 }
 
 impl GirtProxy {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         engine: Arc<DecisionEngine>,
         llm: Arc<dyn LlmClient>,
@@ -50,6 +56,7 @@ impl GirtProxy {
         max_iterations: u32,
         circuit_breaker_policy: girt_pipeline::config::CircuitBreakerPolicy,
         cargo_component_bin: String,
+        approval_manager: Option<Arc<ApprovalManager>>,
     ) -> Self {
         Self {
             engine,
@@ -60,6 +67,7 @@ impl GirtProxy {
             max_iterations,
             circuit_breaker_policy,
             cargo_component_bin,
+            approval_manager,
             server_peer: Arc::new(Mutex::new(None)),
         }
     }
@@ -404,6 +412,71 @@ impl GirtProxy {
                 decision_to_content(&gate_result.decision),
                 true,
             )),
+            Decision::Ask { prompt, context } => {
+                if let Some(ref manager) = self.approval_manager {
+                    // Route through the approval WASM (discord_approval)
+                    let question = format!("{}\n\n{}", prompt, context);
+                    let ctx = serde_json::json!({
+                        "tool_name": spec.name,
+                        "description": spec.description,
+                        "constraints": spec.constraints,
+                    })
+                    .to_string();
+
+                    tracing::info!(
+                        tool = %spec.name,
+                        "Creation Gate returned Ask — routing to discord_approval WASM"
+                    );
+
+                    match manager.request_approval(&question, &ctx).await {
+                        Ok(result) if result.approved => {
+                            tracing::info!(
+                                authorized_by = %result.authorized_by,
+                                evidence_url = %result.evidence_url,
+                                "Human approved — triggering build"
+                            );
+                            self.trigger_build(spec).await
+                        }
+                        Ok(result) => {
+                            tracing::info!(
+                                authorized_by = %result.authorized_by,
+                                "Human denied capability request"
+                            );
+                            Ok(make_tool_result(
+                                vec![Content::text(
+                                    serde_json::json!({
+                                        "status": "denied",
+                                        "reason": "Human denied the capability request",
+                                        "authorized_by": result.authorized_by,
+                                        "evidence_url": result.evidence_url,
+                                    })
+                                    .to_string(),
+                                )],
+                                true,
+                            ))
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "Approval request failed");
+                            Ok(make_tool_result(
+                                vec![Content::text(
+                                    serde_json::json!({
+                                        "status": "approval_failed",
+                                        "error": e,
+                                    })
+                                    .to_string(),
+                                )],
+                                true,
+                            ))
+                        }
+                    }
+                } else {
+                    // No approval manager configured — surface Ask to the MCP caller
+                    Ok(make_tool_result(
+                        decision_to_content(&gate_result.decision),
+                        false,
+                    ))
+                }
+            }
             _ => Ok(make_tool_result(
                 decision_to_content(&gate_result.decision),
                 false,

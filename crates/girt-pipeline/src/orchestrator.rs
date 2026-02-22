@@ -10,7 +10,7 @@ use std::time::Instant;
 use crate::config::CircuitBreakerPolicy;
 use crate::llm::TokenUsage;
 use crate::types::{
-    BugTicket, BugTicketSeverity, BuildArtifact, CapabilityRequest, ComplexityHint,
+    BugTicket, BugTicketSeverity, BuildArtifact, BuildOutput, CapabilityRequest, ComplexityHint,
     ImplementationPlan, IterationTimings, RefinedSpec, SpecAction, StageTimings,
 };
 
@@ -161,6 +161,108 @@ impl<'a> Orchestrator<'a> {
                 );
                 None
             }
+        }
+    }
+
+    /// Like `build_loop` but starts from a pre-generated seed `BuildOutput`
+    /// instead of calling `engineer.build`.  Used by `improve_tool`.
+    async fn build_loop_from_seed(
+        &self,
+        spec: &RefinedSpec,
+        seed: BuildOutput,
+        mut timings: StageTimings,
+        pipeline_start: Instant,
+    ) -> Result<Box<BuildArtifact>, PipelineError> {
+        let engineer = EngineerAgent::new(self.llm)
+            .with_standards(self.coding_standards.clone());
+        let qa = QaAgent::new(self.llm);
+        let red_team = RedTeamAgent::new(self.llm);
+
+        // Seed was already generated (improve step counts as iteration 0)
+        let mut build_output = seed;
+        let mut last_engineer_tokens = TokenUsage::default();
+        let mut last_engineer_ms: u64 = 0;
+        let mut iteration = 1u32;
+
+        // Same QA/RedTeam loop as build_loop
+        loop {
+            tracing::info!(iteration, "Improve iteration starting");
+
+            let qa_start = Instant::now();
+            let (qa_result, qa_tokens) = qa.test(spec, &build_output).await?;
+            let qa_ms = qa_start.elapsed().as_millis() as u64;
+
+            let rt_start = Instant::now();
+            let (security_result, red_team_tokens) = red_team.audit(spec, &build_output).await?;
+            let red_team_ms = rt_start.elapsed().as_millis() as u64;
+
+            timings.iterations.push(IterationTimings {
+                iteration,
+                engineer_ms: last_engineer_ms,
+                engineer_tokens: last_engineer_tokens.clone(),
+                qa_ms,
+                qa_tokens,
+                red_team_ms,
+                red_team_tokens,
+            });
+
+            let mut all_tickets: Vec<BugTicket> = Vec::new();
+            all_tickets.extend(qa_result.bug_tickets.iter().cloned());
+            all_tickets.extend(security_result.bug_tickets.iter().cloned());
+
+            let blocking: Vec<&BugTicket> = all_tickets.iter().filter(|t| t.is_blocking()).collect();
+            let advisory: Vec<&BugTicket> = all_tickets.iter().filter(|t| !t.is_blocking()).collect();
+
+            if !advisory.is_empty() {
+                tracing::info!(count = advisory.len(), "Advisory tickets (non-blocking)");
+            }
+
+            if blocking.is_empty() {
+                timings.total_ms = pipeline_start.elapsed().as_millis() as u64;
+                return Ok(Box::new(BuildArtifact {
+                    spec: spec.spec.clone(),
+                    refined_spec: spec.clone(),
+                    build_output,
+                    qa_result,
+                    security_result,
+                    build_iterations: iteration,
+                    timings,
+                    escalated: false,
+                    escalated_tickets: vec![],
+                }));
+            }
+
+            if iteration >= self.max_iterations {
+                timings.total_ms = pipeline_start.elapsed().as_millis() as u64;
+                let remaining: Vec<BugTicket> = blocking.iter().map(|t| (*t).clone()).collect();
+                let summary = format_ticket_summary(&blocking);
+                match &self.circuit_breaker_policy {
+                    CircuitBreakerPolicy::Fail => {
+                        return Err(PipelineError::CircuitBreaker { attempts: iteration, summary });
+                    }
+                    CircuitBreakerPolicy::Ask | CircuitBreakerPolicy::Proceed => {
+                        return Ok(Box::new(BuildArtifact {
+                            spec: spec.spec.clone(),
+                            refined_spec: spec.clone(),
+                            build_output,
+                            qa_result,
+                            security_result,
+                            build_iterations: iteration,
+                            timings,
+                            escalated: true,
+                            escalated_tickets: remaining,
+                        }));
+                    }
+                }
+            }
+
+            let first_blocking = blocking[0];
+            let fix_start = Instant::now();
+            let (fixed_output, fix_tokens) = engineer.fix(spec, &build_output, first_blocking).await?;
+            last_engineer_ms = fix_start.elapsed().as_millis() as u64;
+            last_engineer_tokens = fix_tokens;
+            build_output = fixed_output;
+            iteration += 1;
         }
     }
 
@@ -363,6 +465,64 @@ impl<'a> Orchestrator<'a> {
         };
 
         match self.build_loop(spec, plan, timings, pipeline_start).await {
+            Ok(artifact) => PipelineOutcome::Built(artifact),
+            Err(e) => PipelineOutcome::Failed(e),
+        }
+    }
+
+    /// Improve an existing tool by incorporating a change request into the
+    /// existing source.  Uses the same QA/RedTeam build loop as `run`, but
+    /// seeds the Engineer with the existing source rather than generating fresh.
+    ///
+    /// `existing_source` — the current `source.rs` content
+    /// `existing_wit`    — the current `world.wit` content (may be empty)
+    /// `change_request`  — plain-language description of what to add/change
+    pub async fn improve_tool(
+        &self,
+        spec: &RefinedSpec,
+        existing_source: &str,
+        existing_wit: &str,
+        change_request: &str,
+    ) -> PipelineOutcome {
+        use std::time::Instant;
+
+        let pipeline_start = Instant::now();
+        let timings = StageTimings {
+            architect_ms: 0,
+            architect_tokens: TokenUsage::default(),
+            planner_ms: None,
+            planner_tokens: None,
+            iterations: vec![],
+            total_ms: 0,
+        };
+
+        // Build the initial seed output from the existing source
+        let engineer = EngineerAgent::new(self.llm)
+            .with_standards(self.coding_standards.clone())
+            .with_max_tokens(16_000);
+
+        let seed_output = match engineer.improve(spec, existing_source, change_request).await {
+            Ok((output, _)) => output,
+            Err(e) => return PipelineOutcome::Failed(e),
+        };
+
+        // Merge existing WIT into seed if engineer didn't provide one
+        let seed_output = if seed_output.wit_definition.trim().is_empty()
+            || !seed_output.wit_definition.contains("package")
+        {
+            crate::types::BuildOutput {
+                wit_definition: existing_wit.to_string(),
+                ..seed_output
+            }
+        } else {
+            seed_output
+        };
+
+        // Re-use the normal build loop from the seeded output
+        match self
+            .build_loop_from_seed(spec, seed_output, timings, pipeline_start)
+            .await
+        {
             Ok(artifact) => PipelineOutcome::Built(artifact),
             Err(e) => PipelineOutcome::Failed(e),
         }

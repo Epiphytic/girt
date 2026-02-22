@@ -309,6 +309,47 @@ impl<'a> EngineerAgent<'a> {
         Ok((output, usage))
     }
 
+    /// Improve an existing tool's source code based on a change request.
+    ///
+    /// Unlike `build` (which generates from scratch), `improve` receives the
+    /// existing source and makes targeted changes.  This is used for:
+    /// - Explicit `improve_tool` MCP calls
+    /// - Auto-triggered when the Architect returns `RecommendExtend`
+    pub async fn improve(
+        &self,
+        spec: &RefinedSpec,
+        existing_source: &str,
+        change_request: &str,
+    ) -> Result<(BuildOutput, TokenUsage), PipelineError> {
+        let spec_json = serde_json::to_string_pretty(spec)
+            .map_err(|e| PipelineError::LlmError(format!("Failed to serialize spec: {e}")))?;
+
+        let plan_text = self.plan_section().unwrap_or_default();
+        let content = format!(
+            "You are improving an existing WASM tool.\n\n\
+             Updated spec (authoritative for inputs, outputs, constraints):\n{spec_json}{plan_text}\n\n\
+             Change request: {change_request}\n\n\
+             EXISTING SOURCE (start from this, make targeted changes only):\n\
+             ```rust\n{existing_source}\n```\n\n\
+             Produce the full updated source. Preserve working logic. \
+             Only change what's needed for the improvement.",
+        );
+
+        let request = LlmRequest {
+            system_prompt: self.system_prompt(),
+            messages: vec![LlmMessage {
+                role: "user".into(),
+                content,
+            }],
+            max_tokens: self.max_tokens,
+        };
+
+        let response = self.llm.chat(&request).await?;
+        let usage = response.usage.clone();
+        let output = self.parse_build_output(&response.content, spec)?;
+        Ok((output, usage))
+    }
+
     fn parse_build_output(
         &self,
         raw: &str,

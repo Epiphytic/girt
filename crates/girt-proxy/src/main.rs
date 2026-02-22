@@ -18,6 +18,7 @@ mod proxy;
 
 use approval::ApprovalManager;
 use evaluator::GateLlmEvaluator;
+use girt_pipeline::tool_sync::ToolSync;
 use proxy::GirtProxy;
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
@@ -186,8 +187,35 @@ async fn run_serve(config_flag: Option<PathBuf>) -> Result<()> {
             None
         };
 
+    // Build optional tool-source sync
+    let tool_sync: Option<Arc<ToolSync>> =
+        if let Some(ref repo_url) = config.registry.source_repo {
+            let local_path = config.registry.source_repo_local
+                .as_deref()
+                .map(|p| {
+                    if p.starts_with('~') {
+                        dirs::home_dir()
+                            .unwrap_or_else(|| std::path::PathBuf::from("."))
+                            .join(&p[2..])
+                    } else {
+                        std::path::PathBuf::from(p)
+                    }
+                })
+                .unwrap_or_else(ToolSync::default_local_path);
+
+            tracing::info!(
+                repo = %repo_url,
+                local = %local_path.display(),
+                "Tool source sync enabled"
+            );
+            Some(Arc::new(ToolSync::new(repo_url, local_path)))
+        } else {
+            tracing::info!("No registry.source_repo configured — tool source sync disabled");
+            None
+        };
+
     // Create proxy handler
-    let proxy = GirtProxy::new(engine, llm, publisher, runtime, coding_standards, config.pipeline.max_iterations, config.pipeline.on_circuit_breaker, config.build.cargo_component_bin, approval_manager);
+    let proxy = GirtProxy::new(engine, llm, publisher, runtime, coding_standards, config.pipeline.max_iterations, config.pipeline.on_circuit_breaker, config.build.cargo_component_bin, approval_manager, tool_sync);
 
     // Serve on stdio (agent connects here)
     let stdio = rmcp::transport::io::stdio();

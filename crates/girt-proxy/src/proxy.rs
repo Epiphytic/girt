@@ -6,6 +6,7 @@ use girt_core::spec::{CapabilitySpec, ExecutionRequest, GateInput};
 use girt_pipeline::llm::LlmClient;
 use girt_pipeline::orchestrator::{Orchestrator, PipelineOutcome};
 use girt_pipeline::publish::Publisher;
+use girt_pipeline::tool_sync::ToolSync;
 use girt_pipeline::types::{CapabilityRequest, RequestSource};
 use girt_runtime::{ComponentMeta, LifecycleManager};
 use crate::approval::ApprovalManager;
@@ -41,6 +42,8 @@ pub struct GirtProxy {
     /// When present, `Ask` decisions from the Creation Gate are routed here
     /// instead of being surfaced to the MCP caller.
     approval_manager: Option<Arc<ApprovalManager>>,
+    /// Optional tool source sync to a git repository.
+    tool_sync: Option<Arc<ToolSync>>,
     /// Server peer for sending tools/list_changed notifications.
     server_peer: Arc<Mutex<Option<Peer<RoleServer>>>>,
 }
@@ -57,6 +60,7 @@ impl GirtProxy {
         circuit_breaker_policy: girt_pipeline::config::CircuitBreakerPolicy,
         cargo_component_bin: String,
         approval_manager: Option<Arc<ApprovalManager>>,
+        tool_sync: Option<Arc<ToolSync>>,
     ) -> Self {
         Self {
             engine,
@@ -68,6 +72,7 @@ impl GirtProxy {
             circuit_breaker_policy,
             cargo_component_bin,
             approval_manager,
+            tool_sync,
             server_peer: Arc::new(Mutex::new(None)),
         }
     }
@@ -544,6 +549,17 @@ impl GirtProxy {
                                 ));
                             }
                         };
+
+                        // Sync source to tool registry (non-fatal if it fails)
+                        if let Some(ref syncer) = self.tool_sync {
+                            if let Err(e) = syncer.sync(&artifact, &publish_result).await {
+                                tracing::warn!(
+                                    tool = %tool_name,
+                                    error = %e,
+                                    "Tool registry sync failed (continuing)"
+                                );
+                            }
+                        }
 
                         // Load into girt-runtime
                         let wasm_path = publish_result.local_path.join("tool.wasm");

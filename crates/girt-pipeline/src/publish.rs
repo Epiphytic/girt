@@ -189,6 +189,8 @@ mod tests {
             },
             build_iterations: 1,
             timings: Default::default(),
+            escalated: false,
+            escalated_tickets: vec![],
         }
     }
 

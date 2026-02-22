@@ -67,9 +67,13 @@ impl ApprovalManager {
         let deadline = Instant::now() + Duration::from_secs(self.config.overall_timeout_secs);
         let mut message_id: Option<String> = None;
         let mut first_call = true;
+        // Exponential backoff state: starts at initial_poll_interval_secs,
+        // doubles each pending cycle, caps at max_poll_interval_secs.
+        let mut poll_interval_secs = self.config.initial_poll_interval_secs;
 
         loop {
-            if Instant::now() >= deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 return Err(format!(
                     "Approval timed out after {}s with no human response",
                     self.config.overall_timeout_secs
@@ -139,8 +143,27 @@ impl ApprovalManager {
                                 }
                             }
                             first_call = false;
-                            // Brief pause before re-invoking to avoid hammering
-                            tokio::time::sleep(Duration::from_secs(2)).await;
+
+                            // Clamp sleep to whichever is smaller: current
+                            // backoff interval or remaining deadline.
+                            let remaining = deadline.saturating_duration_since(Instant::now());
+                            let sleep_secs = poll_interval_secs.min(remaining.as_secs());
+
+                            tracing::info!(
+                                poll_interval_secs,
+                                max_poll_interval_secs = self.config.max_poll_interval_secs,
+                                overall_remaining_secs = remaining.as_secs(),
+                                message_id = ?message_id,
+                                "Approval pending — backing off before next poll"
+                            );
+
+                            tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
+
+                            // Advance backoff for next iteration
+                            poll_interval_secs = ((poll_interval_secs as f64
+                                * self.config.poll_backoff_multiplier)
+                                as u64)
+                                .min(self.config.max_poll_interval_secs);
                         }
                         other => {
                             return Err(format!(

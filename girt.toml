@@ -30,10 +30,15 @@ channel_id = "1474625611908513823"
 guild_id   = "1473159530316566551"
 # Usernames allowed to approve/deny (empty = anyone in the channel)
 authorized_users = ["liamhelmer"]
-# Per-WASM-invocation polling budget (≤60s)
+# Per-WASM-invocation polling budget (≤60s — WASM returns pending if no reaction within this window)
 timeout_secs = 55
-# Overall approval deadline before timing out
-overall_timeout_secs = 300
+# Overall approval deadline. Default: 259200 (3 days). Approval fails if no human responds by then.
+overall_timeout_secs = 259200
+# Exponential backoff between WASM re-invocations.
+# Starts at initial_poll_interval_secs, doubles each pending cycle, caps at max_poll_interval_secs.
+initial_poll_interval_secs = 10   # first re-invoke after 10s
+poll_backoff_multiplier    = 2.0  # double each cycle: 10s → 20s → 40s → ... → 3600s
+max_poll_interval_secs     = 3600 # cap at 1 hour
 # bot_token injected from DISCORD_BOT_TOKEN env (read from OpenClaw config at startup)
 
 [pipeline]

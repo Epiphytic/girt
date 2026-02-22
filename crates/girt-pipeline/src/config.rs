@@ -46,10 +46,21 @@ pub struct ApprovalConfig {
     /// the caller (ApprovalManager) re-invokes with the resume token.
     #[serde(default = "default_approval_timeout_secs")]
     pub timeout_secs: u64,
-    /// Overall approval deadline in seconds (default: 300 = 5 minutes).
+    /// Overall approval deadline in seconds (default: 259200 = 3 days).
     /// If no human responds before this elapses, the approval request fails.
     #[serde(default = "default_overall_timeout_secs")]
     pub overall_timeout_secs: u64,
+    /// Initial delay between WASM re-invocations in seconds (default: 10).
+    /// Doubles after each `pending` response, up to `max_poll_interval_secs`.
+    #[serde(default = "default_initial_poll_interval_secs")]
+    pub initial_poll_interval_secs: u64,
+    /// Multiplier applied to the poll interval after each `pending` response
+    /// (default: 2.0 — exponential doubling).
+    #[serde(default = "default_poll_backoff_multiplier")]
+    pub poll_backoff_multiplier: f64,
+    /// Maximum delay between WASM re-invocations in seconds (default: 3600 = 1 hour).
+    #[serde(default = "default_max_poll_interval_secs")]
+    pub max_poll_interval_secs: u64,
 }
 
 fn default_approval_component() -> String {
@@ -59,7 +70,16 @@ fn default_approval_timeout_secs() -> u64 {
     55
 }
 fn default_overall_timeout_secs() -> u64 {
-    300
+    259_200 // 3 days
+}
+fn default_initial_poll_interval_secs() -> u64 {
+    10
+}
+fn default_poll_backoff_multiplier() -> f64 {
+    2.0
+}
+fn default_max_poll_interval_secs() -> u64 {
+    3_600 // 1 hour
 }
 
 /// Security and gate configuration.

@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use girt_core::decision::{Decision, GateKind};
 use girt_core::engine::DecisionEngine;
@@ -44,6 +45,10 @@ pub struct GirtProxy {
     approval_manager: Option<Arc<ApprovalManager>>,
     /// Optional tool source sync to a git repository.
     tool_sync: Option<Arc<ToolSync>>,
+    /// Hard wall on active build time (LLM calls + compilation).
+    /// Approval wait time is NOT counted — the clock only runs while the
+    /// pipeline is actually working.
+    build_timeout_secs: u64,
     /// Server peer for sending tools/list_changed notifications.
     server_peer: Arc<Mutex<Option<Peer<RoleServer>>>>,
 }
@@ -61,6 +66,7 @@ impl GirtProxy {
         cargo_component_bin: String,
         approval_manager: Option<Arc<ApprovalManager>>,
         tool_sync: Option<Arc<ToolSync>>,
+        build_timeout_secs: u64,
     ) -> Self {
         Self {
             engine,
@@ -73,6 +79,7 @@ impl GirtProxy {
             cargo_component_bin,
             approval_manager,
             tool_sync,
+            build_timeout_secs,
             server_peer: Arc::new(Mutex::new(None)),
         }
     }
@@ -504,7 +511,26 @@ impl GirtProxy {
             .with_standards(self.coding_standards.clone())
             .with_max_iterations(self.max_iterations)
             .with_circuit_breaker_policy(self.circuit_breaker_policy.clone());
-        let outcome = orchestrator.run(&cap_request).await;
+
+        // Only active build time counts against this limit — approval wait
+        // time is excluded because the clock starts here, after approval.
+        let build_budget = Duration::from_secs(self.build_timeout_secs);
+        let outcome = match tokio::time::timeout(build_budget, orchestrator.run(&cap_request)).await {
+            Ok(outcome) => outcome,
+            Err(_elapsed) => {
+                tracing::error!(
+                    tool = %tool_name,
+                    build_timeout_secs = self.build_timeout_secs,
+                    "Build pipeline exceeded time budget"
+                );
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Build timed out after {}s. \
+                     Approval wait time is not counted — only active pipeline time. \
+                     Consider increasing pipeline.build_timeout_secs in girt.toml.",
+                    self.build_timeout_secs
+                ))]));
+            }
+        };
 
         match outcome {
             PipelineOutcome::Built(artifact) => {

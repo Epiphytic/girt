@@ -51,6 +51,9 @@ coding_standards_path = "~/.openclaw/workspace/CLAUDE.md"
 # Maximum Engineer → QA/RedTeam iterations before the circuit breaker triggers.
 # Default: 3. Increase for complex security-sensitive components.
 max_iterations = 3
+# Hard wall on active build time (LLM calls + compilation). Approval wait time is NOT counted.
+# The clock starts only after an approval is granted. Default: 3600 (1 hour).
+build_timeout_secs = 3600
 # What to do when the fix loop exhausts max_iterations with blocking tickets remaining.
 # ask     = escalate to human for a decision (future: via approval WASM; now: falls back to proceed)
 # proceed = ship the build with remaining tickets logged in the artifact (fail open)

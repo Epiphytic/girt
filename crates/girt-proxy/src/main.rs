@@ -215,7 +215,7 @@ async fn run_serve(config_flag: Option<PathBuf>) -> Result<()> {
         };
 
     // Create proxy handler
-    let proxy = GirtProxy::new(engine, llm, publisher, runtime, coding_standards, config.pipeline.max_iterations, config.pipeline.on_circuit_breaker, config.build.cargo_component_bin, approval_manager, tool_sync);
+    let proxy = GirtProxy::new(engine, llm, publisher, runtime, coding_standards, config.pipeline.max_iterations, config.pipeline.on_circuit_breaker, config.build.cargo_component_bin, approval_manager, tool_sync, config.pipeline.build_timeout_secs);
 
     // Serve on stdio (agent connects here)
     let stdio = rmcp::transport::io::stdio();

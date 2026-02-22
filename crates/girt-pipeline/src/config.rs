@@ -114,6 +114,12 @@ pub struct PipelineConfig {
     /// tickets remaining. Default: Ask.
     #[serde(default)]
     pub on_circuit_breaker: CircuitBreakerPolicy,
+
+    /// Hard wall on actual build time (LLM calls + compilation) in seconds.
+    /// Approval wait time is excluded — the clock only runs while the pipeline
+    /// is actively working.  Default: 3600 (1 hour).
+    #[serde(default = "default_build_timeout_secs")]
+    pub build_timeout_secs: u64,
 }
 
 /// Policy for when the pipeline fix loop exhausts its iteration budget.
@@ -135,6 +141,9 @@ pub enum CircuitBreakerPolicy {
 fn default_max_iterations() -> u32 {
     3
 }
+fn default_build_timeout_secs() -> u64 {
+    3_600 // 1 hour
+}
 
 impl Default for PipelineConfig {
     fn default() -> Self {
@@ -142,6 +151,7 @@ impl Default for PipelineConfig {
             coding_standards_path: None,
             max_iterations: default_max_iterations(),
             on_circuit_breaker: CircuitBreakerPolicy::default(),
+            build_timeout_secs: default_build_timeout_secs(),
         }
     }
 }

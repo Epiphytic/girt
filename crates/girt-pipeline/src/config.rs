@@ -163,6 +163,13 @@ pub struct RegistryConfig {
     #[serde(default = "default_registry_url")]
     pub url: String,
     pub token: Option<String>,
+    /// Git repository URL to sync tool source into after each successful build.
+    /// When set, GIRT pushes each tool's source, WIT, manifest, and policy
+    /// into `{repo}/{tool_name}/` on the `main` branch.
+    /// Optional — leave unset to disable source sync.
+    pub source_repo: Option<String>,
+    /// Local clone path for the source repo (default: `~/.girt/tool-registry`).
+    pub source_repo_local: Option<String>,
 }
 
 fn default_registry_url() -> String {

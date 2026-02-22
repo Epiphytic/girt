@@ -17,6 +17,49 @@ pub struct GirtConfig {
     pub pipeline: PipelineConfig,
     #[serde(default)]
     pub security: SecurityConfig,
+    /// Human-in-the-loop approval configuration (drives discord_approval WASM).
+    /// When present and `creation_gate = "llm"`, ASK decisions are routed
+    /// through the configured approval WASM instead of surfaced to the caller.
+    pub approval: Option<ApprovalConfig>,
+}
+
+/// Configuration for the human-in-the-loop approval WASM.
+///
+/// When set, the proxy calls the approval WASM whenever the Creation Gate
+/// returns `Ask`, rather than surfacing the decision to the MCP caller.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApprovalConfig {
+    /// Tool name of the approval WASM component (default: "discord_approval").
+    #[serde(default = "default_approval_component")]
+    pub component: String,
+    /// Discord channel ID to post approval requests to.
+    pub channel_id: String,
+    /// Discord guild ID (used for evidence URL permalink).
+    pub guild_id: String,
+    /// Bot token. If `None`, read from `$DISCORD_BOT_TOKEN` env var at runtime.
+    pub bot_token: Option<String>,
+    /// Discord usernames allowed to respond (empty list = anyone may respond).
+    #[serde(default)]
+    pub authorized_users: Vec<String>,
+    /// Per-WASM-invocation timeout in seconds (default: 55, must be ≤ 60).
+    /// The WASM returns `pending` if no response arrives within this window;
+    /// the caller (ApprovalManager) re-invokes with the resume token.
+    #[serde(default = "default_approval_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Overall approval deadline in seconds (default: 300 = 5 minutes).
+    /// If no human responds before this elapses, the approval request fails.
+    #[serde(default = "default_overall_timeout_secs")]
+    pub overall_timeout_secs: u64,
+}
+
+fn default_approval_component() -> String {
+    "discord_approval".to_string()
+}
+fn default_approval_timeout_secs() -> u64 {
+    55
+}
+fn default_overall_timeout_secs() -> u64 {
+    300
 }
 
 /// Security and gate configuration.

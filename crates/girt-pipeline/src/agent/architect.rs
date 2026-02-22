@@ -114,7 +114,7 @@ impl<'a> ArchitectAgent<'a> {
                     "Refine this capability request into a robust tool spec:\n\n{spec_json}"
                 ),
             }],
-            max_tokens: 100_000,
+            max_tokens: 64_000,
         };
 
         let response = self.llm.chat(&request).await?;

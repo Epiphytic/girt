@@ -22,8 +22,19 @@ max_tokens = 64000
 [security]
 # "llm"         — full LLM + HITL approval for every new tool (default)
 # "policy_only" — policy rules enforced, LLM gate bypassed (bootstrap only)
-# TODO: switch back to "llm" after discord_approval.cwasm is built and registered
-creation_gate = "policy_only"
+creation_gate = "llm"
+
+[approval]
+# discord_approval WASM routes Ask decisions to this channel
+channel_id = "1474625611908513823"
+guild_id   = "1473159530316566551"
+# Usernames allowed to approve/deny (empty = anyone in the channel)
+authorized_users = ["liamhelmer"]
+# Per-WASM-invocation polling budget (≤60s)
+timeout_secs = 55
+# Overall approval deadline before timing out
+overall_timeout_secs = 300
+# bot_token injected from DISCORD_BOT_TOKEN env (read from OpenClaw config at startup)
 
 [pipeline]
 # Path to a coding standards / conventions file.

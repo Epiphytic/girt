@@ -1,13 +1,21 @@
 use crate::agent::architect::ArchitectAgent;
 use crate::agent::engineer::EngineerAgent;
+use crate::agent::planner::PlannerAgent;
 use crate::agent::qa::QaAgent;
 use crate::agent::red_team::RedTeamAgent;
 use crate::error::PipelineError;
 use crate::llm::LlmClient;
-use crate::types::{BugTicket, BuildArtifact, CapabilityRequest, RefinedSpec, SpecAction};
+use std::time::Instant;
 
-/// Maximum number of build-fix iterations before circuit breaker triggers.
-const MAX_ITERATIONS: u32 = 3;
+use crate::config::CircuitBreakerPolicy;
+use crate::llm::TokenUsage;
+use crate::types::{
+    BugTicket, BugTicketSeverity, BuildArtifact, BuildOutput, CapabilityRequest, ComplexityHint,
+    ImplementationPlan, IterationTimings, RefinedSpec, SpecAction, StageTimings,
+};
+
+/// Default maximum build-fix iterations. Override via `pipeline.max_iterations` in girt.toml.
+const DEFAULT_MAX_ITERATIONS: u32 = 3;
 
 /// Result of a single pipeline run.
 #[derive(Debug)]
@@ -35,6 +43,10 @@ pub struct Orchestrator<'a> {
     llm: &'a dyn LlmClient,
     /// Optional coding standards to inject into the Engineer's system prompt.
     coding_standards: Option<String>,
+    /// Maximum Engineer → QA/RedTeam iterations before the circuit breaker fires.
+    max_iterations: u32,
+    /// What to do when the iteration limit is reached with blocking tickets remaining.
+    circuit_breaker_policy: CircuitBreakerPolicy,
 }
 
 impl<'a> Orchestrator<'a> {
@@ -42,6 +54,8 @@ impl<'a> Orchestrator<'a> {
         Self {
             llm,
             coding_standards: None,
+            max_iterations: DEFAULT_MAX_ITERATIONS,
+            circuit_breaker_policy: CircuitBreakerPolicy::default(),
         }
     }
 
@@ -51,16 +65,34 @@ impl<'a> Orchestrator<'a> {
         self
     }
 
+    /// Override the circuit breaker iteration limit.
+    pub fn with_max_iterations(mut self, max_iterations: u32) -> Self {
+        self.max_iterations = max_iterations;
+        self
+    }
+
+    /// Set the circuit breaker escalation policy.
+    pub fn with_circuit_breaker_policy(mut self, policy: CircuitBreakerPolicy) -> Self {
+        self.circuit_breaker_policy = policy;
+        self
+    }
+
     /// Run the full pipeline for a capability request.
     pub async fn run(&self, request: &CapabilityRequest) -> PipelineOutcome {
+        let pipeline_start = Instant::now();
+
         // Phase 1: Architect refines the spec
-        let refined = match self.architect_phase(&request.spec).await {
-            Ok(refined) => refined,
+        let arch_start = Instant::now();
+        let (refined, architect_tokens) = match self.architect_phase(&request.spec).await {
+            Ok(result) => result,
             Err(e) => {
                 tracing::warn!(error = %e, "Architect failed, using passthrough spec");
-                ArchitectAgent::passthrough(&request.spec)
+                (ArchitectAgent::passthrough(&request.spec), TokenUsage::default())
             }
         };
+        let architect_ms = arch_start.elapsed().as_millis() as u64;
+        tracing::info!(architect_ms, input_tokens = architect_tokens.input_tokens,
+            output_tokens = architect_tokens.output_tokens, "Architect phase complete");
 
         // Check if architect recommends extending instead of building
         if refined.action == SpecAction::RecommendExtend {
@@ -70,8 +102,29 @@ impl<'a> Orchestrator<'a> {
             };
         }
 
+        // Phase 1.5: Planner (runs for complex specs before Engineer)
+        let planner_start = Instant::now();
+        let planner_result = self.planner_phase(&refined).await;
+        let (plan, planner_ms, planner_tokens) = if let Some((p, u)) = planner_result {
+            let ms = planner_start.elapsed().as_millis() as u64;
+            tracing::info!(planner_ms = ms, input_tokens = u.input_tokens,
+                output_tokens = u.output_tokens, "Planner phase complete");
+            (Some(p), Some(ms), Some(u))
+        } else {
+            (None, None, None)
+        };
+
+        let partial_timings = StageTimings {
+            architect_ms,
+            architect_tokens,
+            planner_ms,
+            planner_tokens,
+            iterations: vec![],
+            total_ms: 0,
+        };
+
         // Phase 2-4: Build loop with QA and Red Team validation
-        match self.build_loop(&refined).await {
+        match self.build_loop(&refined, plan, partial_timings, pipeline_start).await {
             Ok(artifact) => PipelineOutcome::Built(artifact),
             Err(e) => PipelineOutcome::Failed(e),
         }
@@ -80,37 +133,92 @@ impl<'a> Orchestrator<'a> {
     async fn architect_phase(
         &self,
         spec: &girt_core::spec::CapabilitySpec,
-    ) -> Result<RefinedSpec, PipelineError> {
+    ) -> Result<(RefinedSpec, TokenUsage), PipelineError> {
         let architect = ArchitectAgent::new(self.llm);
-        let refined = architect.refine(spec).await?;
+        let (refined, usage) = architect.refine(spec).await?;
         tracing::info!(name = %refined.spec.name, action = ?refined.action, "Spec refined");
-        Ok(refined)
+        Ok((refined, usage))
     }
 
-    async fn build_loop(&self, spec: &RefinedSpec) -> Result<Box<BuildArtifact>, PipelineError> {
+    /// Run the Planner if the spec meets complexity triggers; return `None` on skip or failure.
+    async fn planner_phase(&self, spec: &RefinedSpec) -> Option<(ImplementationPlan, TokenUsage)> {
+        if !needs_planner(spec) {
+            tracing::debug!(spec_name = %spec.spec.name, "Planner skipped (low complexity)");
+            return None;
+        }
+
+        tracing::info!(spec_name = %spec.spec.name, "Running Planner (complex spec detected)");
+        match PlannerAgent::new(self.llm).plan(spec).await {
+            Ok((plan, usage)) => {
+                tracing::info!(spec_name = %spec.spec.name, "Planner completed");
+                Some((plan, usage))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    spec_name = %spec.spec.name,
+                    "Planner failed; proceeding without implementation plan"
+                );
+                None
+            }
+        }
+    }
+
+    /// Like `build_loop` but starts from a pre-generated seed `BuildOutput`
+    /// instead of calling `engineer.build`.  Used by `improve_tool`.
+    async fn build_loop_from_seed(
+        &self,
+        spec: &RefinedSpec,
+        seed: BuildOutput,
+        mut timings: StageTimings,
+        pipeline_start: Instant,
+    ) -> Result<Box<BuildArtifact>, PipelineError> {
         let engineer = EngineerAgent::new(self.llm)
             .with_standards(self.coding_standards.clone());
         let qa = QaAgent::new(self.llm);
         let red_team = RedTeamAgent::new(self.llm);
 
-        let mut build_output = engineer.build(spec).await?;
+        // Seed was already generated (improve step counts as iteration 0)
+        let mut build_output = seed;
+        let mut last_engineer_tokens = TokenUsage::default();
+        let mut last_engineer_ms: u64 = 0;
         let mut iteration = 1u32;
 
+        // Same QA/RedTeam loop as build_loop
         loop {
-            tracing::info!(iteration, "Build iteration starting");
+            tracing::info!(iteration, "Improve iteration starting");
 
-            // Run QA and Red Team
-            let qa_result = qa.test(spec, &build_output).await?;
-            let security_result = red_team.audit(spec, &build_output).await?;
+            let qa_start = Instant::now();
+            let (qa_result, qa_tokens) = qa.test(spec, &build_output).await?;
+            let qa_ms = qa_start.elapsed().as_millis() as u64;
 
-            // Collect bug tickets from both
-            let mut tickets: Vec<BugTicket> = Vec::new();
-            tickets.extend(qa_result.bug_tickets.iter().cloned());
-            tickets.extend(security_result.bug_tickets.iter().cloned());
+            let rt_start = Instant::now();
+            let (security_result, red_team_tokens) = red_team.audit(spec, &build_output).await?;
+            let red_team_ms = rt_start.elapsed().as_millis() as u64;
 
-            // If both passed, we're done
-            if qa_result.passed && security_result.passed {
-                tracing::info!(iterations = iteration, "Pipeline passed all checks");
+            timings.iterations.push(IterationTimings {
+                iteration,
+                engineer_ms: last_engineer_ms,
+                engineer_tokens: last_engineer_tokens.clone(),
+                qa_ms,
+                qa_tokens,
+                red_team_ms,
+                red_team_tokens,
+            });
+
+            let mut all_tickets: Vec<BugTicket> = Vec::new();
+            all_tickets.extend(qa_result.bug_tickets.iter().cloned());
+            all_tickets.extend(security_result.bug_tickets.iter().cloned());
+
+            let blocking: Vec<&BugTicket> = all_tickets.iter().filter(|t| t.is_blocking()).collect();
+            let advisory: Vec<&BugTicket> = all_tickets.iter().filter(|t| !t.is_blocking()).collect();
+
+            if !advisory.is_empty() {
+                tracing::info!(count = advisory.len(), "Advisory tickets (non-blocking)");
+            }
+
+            if blocking.is_empty() {
+                timings.total_ms = pipeline_start.elapsed().as_millis() as u64;
                 return Ok(Box::new(BuildArtifact {
                     spec: spec.spec.clone(),
                     refined_spec: spec.clone(),
@@ -118,31 +226,210 @@ impl<'a> Orchestrator<'a> {
                     qa_result,
                     security_result,
                     build_iterations: iteration,
+                    timings,
+                    escalated: false,
+                    escalated_tickets: vec![],
                 }));
             }
 
-            // Circuit breaker
-            if iteration >= MAX_ITERATIONS {
-                let summary = format_ticket_summary(&tickets);
-                tracing::error!(
-                    iteration,
-                    tickets = tickets.len(),
-                    "Circuit breaker: max iterations reached"
-                );
-                return Err(PipelineError::CircuitBreaker {
-                    attempts: iteration,
-                    summary,
-                });
+            if iteration >= self.max_iterations {
+                timings.total_ms = pipeline_start.elapsed().as_millis() as u64;
+                let remaining: Vec<BugTicket> = blocking.iter().map(|t| (*t).clone()).collect();
+                let summary = format_ticket_summary(&blocking);
+                match &self.circuit_breaker_policy {
+                    CircuitBreakerPolicy::Fail => {
+                        return Err(PipelineError::CircuitBreaker { attempts: iteration, summary });
+                    }
+                    CircuitBreakerPolicy::Ask | CircuitBreakerPolicy::Proceed => {
+                        return Ok(Box::new(BuildArtifact {
+                            spec: spec.spec.clone(),
+                            refined_spec: spec.clone(),
+                            build_output,
+                            qa_result,
+                            security_result,
+                            build_iterations: iteration,
+                            timings,
+                            escalated: true,
+                            escalated_tickets: remaining,
+                        }));
+                    }
+                }
             }
 
-            // Fix: pick the first ticket and send it back to engineer
-            if let Some(ticket) = tickets.first() {
+            let first_blocking = blocking[0];
+            let fix_start = Instant::now();
+            let (fixed_output, fix_tokens) = engineer.fix(spec, &build_output, first_blocking).await?;
+            last_engineer_ms = fix_start.elapsed().as_millis() as u64;
+            last_engineer_tokens = fix_tokens;
+            build_output = fixed_output;
+            iteration += 1;
+        }
+    }
+
+    async fn build_loop(
+        &self,
+        spec: &RefinedSpec,
+        plan: Option<ImplementationPlan>,
+        mut timings: StageTimings,
+        pipeline_start: Instant,
+    ) -> Result<Box<BuildArtifact>, PipelineError> {
+        let engineer = EngineerAgent::new(self.llm)
+            .with_standards(self.coding_standards.clone())
+            .with_plan(plan);
+        let qa = QaAgent::new(self.llm);
+        let red_team = RedTeamAgent::new(self.llm);
+
+        let eng_start = Instant::now();
+        let (mut build_output, mut last_engineer_tokens) = engineer.build(spec).await?;
+        let mut last_engineer_ms = eng_start.elapsed().as_millis() as u64;
+        let mut iteration = 1u32;
+
+        loop {
+            tracing::info!(iteration, "Build iteration starting");
+
+            let qa_start = Instant::now();
+            let (qa_result, qa_tokens) = qa.test(spec, &build_output).await?;
+            let qa_ms = qa_start.elapsed().as_millis() as u64;
+
+            let rt_start = Instant::now();
+            let (security_result, red_team_tokens) = red_team.audit(spec, &build_output).await?;
+            let red_team_ms = rt_start.elapsed().as_millis() as u64;
+
+            timings.iterations.push(IterationTimings {
+                iteration,
+                engineer_ms: last_engineer_ms,
+                engineer_tokens: last_engineer_tokens.clone(),
+                qa_ms,
+                qa_tokens,
+                red_team_ms,
+                red_team_tokens,
+            });
+            tracing::info!(
+                iteration, last_engineer_ms, qa_ms, red_team_ms,
+                "Iteration timings"
+            );
+
+            // Collect all bug tickets from both agents
+            let mut all_tickets: Vec<BugTicket> = Vec::new();
+            all_tickets.extend(qa_result.bug_tickets.iter().cloned());
+            all_tickets.extend(security_result.bug_tickets.iter().cloned());
+
+            // Split into blocking (Critical/High) and advisory (Medium/Low)
+            let blocking: Vec<&BugTicket> =
+                all_tickets.iter().filter(|t| t.is_blocking()).collect();
+            let advisory: Vec<&BugTicket> =
+                all_tickets.iter().filter(|t| !t.is_blocking()).collect();
+
+            if !advisory.is_empty() {
+                tracing::info!(
+                    count = advisory.len(),
+                    "Advisory tickets (Medium/Low) — reported, not blocking"
+                );
+            }
+
+            // Pass when no blocking tickets remain (advisory tickets are fine)
+            if blocking.is_empty() {
+                timings.total_ms = pipeline_start.elapsed().as_millis() as u64;
+                tracing::info!(
+                    iterations = iteration,
+                    advisory = advisory.len(),
+                    total_ms = timings.total_ms,
+                    architect_ms = timings.architect_ms,
+                    planner_ms = ?timings.planner_ms,
+                    total_engineer_ms = timings.total_engineer_ms(),
+                    total_qa_ms = timings.total_qa_ms(),
+                    total_red_team_ms = timings.total_red_team_ms(),
+                    total_input_tokens = timings.total_input_tokens(),
+                    total_output_tokens = timings.total_output_tokens(),
+                    "Pipeline passed — stage timing + token summary"
+                );
+                return Ok(Box::new(BuildArtifact {
+                    spec: spec.spec.clone(),
+                    refined_spec: spec.clone(),
+                    build_output,
+                    qa_result,
+                    security_result,
+                    build_iterations: iteration,
+                    timings,
+                    escalated: false,
+                    escalated_tickets: vec![],
+                }));
+            }
+
+            // Iteration limit reached with blocking tickets remaining
+            if iteration >= self.max_iterations {
+                timings.total_ms = pipeline_start.elapsed().as_millis() as u64;
+                let remaining: Vec<BugTicket> = blocking.iter().map(|t| (*t).clone()).collect();
+                let summary = format_ticket_summary(&blocking);
+
+                match &self.circuit_breaker_policy {
+                    CircuitBreakerPolicy::Fail => {
+                        tracing::error!(
+                            iteration, blocking = blocking.len(),
+                            "Circuit breaker: failing pipeline (on_circuit_breaker=fail)"
+                        );
+                        return Err(PipelineError::CircuitBreaker {
+                            attempts: iteration,
+                            summary,
+                        });
+                    }
+                    CircuitBreakerPolicy::Ask => {
+                        // Future: route through approval WASM.
+                        // Now: fall through to Proceed with a warning.
+                        tracing::warn!(
+                            iteration, blocking = blocking.len(),
+                            "Circuit breaker: no approval mechanism configured, \
+                             failing open (on_circuit_breaker=ask, no WASM available)"
+                        );
+                        // fall through to Proceed
+                        tracing::warn!(summary, "Proceeding with unresolved blocking tickets");
+                        return Ok(Box::new(BuildArtifact {
+                            spec: spec.spec.clone(),
+                            refined_spec: spec.clone(),
+                            build_output,
+                            qa_result,
+                            security_result,
+                            build_iterations: iteration,
+                            timings,
+                            escalated: true,
+                            escalated_tickets: remaining,
+                        }));
+                    }
+                    CircuitBreakerPolicy::Proceed => {
+                        tracing::warn!(
+                            iteration, blocking = blocking.len(),
+                            "Circuit breaker: proceeding with unresolved tickets \
+                             (on_circuit_breaker=proceed)"
+                        );
+                        tracing::warn!(summary, "Unresolved blocking tickets");
+                        return Ok(Box::new(BuildArtifact {
+                            spec: spec.spec.clone(),
+                            refined_spec: spec.clone(),
+                            build_output,
+                            qa_result,
+                            security_result,
+                            build_iterations: iteration,
+                            timings,
+                            escalated: true,
+                            escalated_tickets: remaining,
+                        }));
+                    }
+                }
+            }
+
+            // Fix: pick the first BLOCKING ticket and send it back to engineer
+            if let Some(ticket) = blocking.first() {
                 tracing::info!(
                     iteration,
+                    severity = ?ticket.severity,
                     ticket_type = ?ticket.ticket_type,
                     "Sending fix directive to engineer"
                 );
-                build_output = engineer.fix(spec, &build_output, ticket).await?;
+                let fix_start = Instant::now();
+                let (fixed_output, fix_tokens) = engineer.fix(spec, &build_output, ticket).await?;
+                build_output = fixed_output;
+                last_engineer_ms = fix_start.elapsed().as_millis() as u64;
+                last_engineer_tokens = fix_tokens;
             }
 
             iteration += 1;
@@ -159,21 +446,145 @@ impl<'a> Orchestrator<'a> {
             };
         }
 
-        match self.build_loop(spec).await {
+        let pipeline_start = Instant::now();
+        let planner_start = Instant::now();
+        let planner_result = self.planner_phase(spec).await;
+        let (plan, planner_ms, planner_tokens) = if let Some((p, u)) = planner_result {
+            (Some(p), Some(planner_start.elapsed().as_millis() as u64), Some(u))
+        } else {
+            (None, None, None)
+        };
+
+        let timings = StageTimings {
+            architect_ms: 0,
+            architect_tokens: TokenUsage::default(),
+            planner_ms,
+            planner_tokens,
+            iterations: vec![],
+            total_ms: 0,
+        };
+
+        match self.build_loop(spec, plan, timings, pipeline_start).await {
+            Ok(artifact) => PipelineOutcome::Built(artifact),
+            Err(e) => PipelineOutcome::Failed(e),
+        }
+    }
+
+    /// Improve an existing tool by incorporating a change request into the
+    /// existing source.  Uses the same QA/RedTeam build loop as `run`, but
+    /// seeds the Engineer with the existing source rather than generating fresh.
+    ///
+    /// `existing_source` — the current `source.rs` content
+    /// `existing_wit`    — the current `world.wit` content (may be empty)
+    /// `change_request`  — plain-language description of what to add/change
+    pub async fn improve_tool(
+        &self,
+        spec: &RefinedSpec,
+        existing_source: &str,
+        existing_wit: &str,
+        change_request: &str,
+    ) -> PipelineOutcome {
+        use std::time::Instant;
+
+        let pipeline_start = Instant::now();
+        let timings = StageTimings {
+            architect_ms: 0,
+            architect_tokens: TokenUsage::default(),
+            planner_ms: None,
+            planner_tokens: None,
+            iterations: vec![],
+            total_ms: 0,
+        };
+
+        // Build the initial seed output from the existing source
+        let engineer = EngineerAgent::new(self.llm)
+            .with_standards(self.coding_standards.clone())
+            .with_max_tokens(16_000);
+
+        let seed_output = match engineer.improve(spec, existing_source, change_request).await {
+            Ok((output, _)) => output,
+            Err(e) => return PipelineOutcome::Failed(e),
+        };
+
+        // Merge existing WIT into seed if engineer didn't provide one
+        let seed_output = if seed_output.wit_definition.trim().is_empty()
+            || !seed_output.wit_definition.contains("package")
+        {
+            crate::types::BuildOutput {
+                wit_definition: existing_wit.to_string(),
+                ..seed_output
+            }
+        } else {
+            seed_output
+        };
+
+        // Re-use the normal build loop from the seeded output
+        match self
+            .build_loop_from_seed(spec, seed_output, timings, pipeline_start)
+            .await
+        {
             Ok(artifact) => PipelineOutcome::Built(artifact),
             Err(e) => PipelineOutcome::Failed(e),
         }
     }
 }
 
-fn format_ticket_summary(tickets: &[BugTicket]) -> String {
+/// Determine whether the Planner agent should run for this spec.
+///
+/// Triggers on structural signals (network calls, secrets, async/polling
+/// language in the description, multiple user-supplied string inputs) as well
+/// as an explicit `complexity_hint: "high"` from the Architect.
+fn needs_planner(spec: &RefinedSpec) -> bool {
+    // Explicit override from Architect
+    if spec.complexity_hint == Some(ComplexityHint::High) {
+        return true;
+    }
+
+    let constraints = &spec.spec.constraints;
+
+    // Any outbound network calls → potentially injection surfaces + error handling
+    if !constraints.network.is_empty() {
+        return true;
+    }
+
+    // Any secrets → credential hygiene required
+    if !constraints.secrets.is_empty() {
+        return true;
+    }
+
+    // Async/polling language → timing edge cases, loop termination
+    let desc = spec.spec.description.to_lowercase();
+    if desc.contains("poll") || desc.contains("wait") || desc.contains("timeout") {
+        return true;
+    }
+
+    // Multiple user-supplied string inputs → potential injection surfaces
+    if let Some(obj) = spec.spec.inputs.as_object() {
+        let string_inputs = obj
+            .values()
+            .filter(|v| {
+                v.as_str()
+                    .map(|s| s.to_lowercase().contains("string") || s.to_lowercase().contains("str"))
+                    .unwrap_or(false)
+            })
+            .count();
+        if string_inputs >= 2 {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn format_ticket_summary(tickets: &[&BugTicket]) -> String {
     tickets
         .iter()
         .enumerate()
         .map(|(i, t)| {
             format!(
-                "#{}: [{:?}] expected: {}, actual: {}",
+                "#{}: [{:?}/{:?}] expected: {}, actual: {}",
                 i + 1,
+                t.severity,
                 t.ticket_type,
                 t.expected,
                 t.actual
@@ -216,6 +627,7 @@ mod tests {
             design_notes: "test".into(),
             extend_target: None,
             extend_features: None,
+            complexity_hint: None,
         }
     }
 
@@ -446,7 +858,8 @@ mod tests {
             security_fail.to_string(),
         ]);
 
-        let orchestrator = Orchestrator::new(&client);
+        let orchestrator = Orchestrator::new(&client)
+            .with_circuit_breaker_policy(crate::config::CircuitBreakerPolicy::Fail);
         let spec = make_refined_spec();
 
         let outcome = orchestrator.run_from_spec(&spec).await;
@@ -456,6 +869,43 @@ mod tests {
                 assert!(!summary.is_empty());
             }
             other => panic!("Expected Failed(CircuitBreaker), got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_proceeds_when_policy_is_proceed() {
+        let engineer_resp = serde_json::json!({
+            "source_code": "fn main() {}",
+            "wit_definition": "package test:tool;",
+            "policy_yaml": "version: \"1.0\"",
+            "language": "rust"
+        });
+        let qa_fail = serde_json::json!({
+            "passed": false, "tests_run": 1, "tests_passed": 0, "tests_failed": 1,
+            "bug_tickets": [{"target":"engineer","ticket_type":"functional_defect",
+                "input":{},"expected":"ok","actual":"fail","remediation_directive":"fix it"}]
+        });
+        let security_ok = serde_json::json!({
+            "passed": true, "exploits_attempted": 0, "exploits_succeeded": 0, "bug_tickets": []
+        });
+        // 3 iterations: build + (qa_fail + security_ok + fix) × 3
+        let client = StubLlmClient::new(vec![
+            engineer_resp.to_string(),
+            qa_fail.to_string(), security_ok.to_string(), engineer_resp.to_string(),
+            qa_fail.to_string(), security_ok.to_string(), engineer_resp.to_string(),
+            qa_fail.to_string(), security_ok.to_string(),
+        ]);
+        let orchestrator = Orchestrator::new(&client)
+            .with_circuit_breaker_policy(crate::config::CircuitBreakerPolicy::Proceed);
+        let spec = make_refined_spec();
+
+        let outcome = orchestrator.run_from_spec(&spec).await;
+        match outcome {
+            PipelineOutcome::Built(artifact) => {
+                assert!(artifact.escalated);
+                assert!(!artifact.escalated_tickets.is_empty());
+            }
+            other => panic!("Expected Built (escalated), got {:?}", other),
         }
     }
 
@@ -473,6 +923,7 @@ mod tests {
             design_notes: "extend instead".into(),
             extend_target: Some("existing".into()),
             extend_features: Some(vec!["feat_a".into()]),
+            complexity_hint: None,
         };
 
         let client = StubLlmClient::constant("unused");

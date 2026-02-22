@@ -73,6 +73,35 @@ impl DecisionEngine {
         }
     }
 
+    /// Create an engine where the Creation Gate uses only the policy layer
+    /// (hard security rules still enforced) but skips LLM/HITL evaluation —
+    /// every spec that passes policy is automatically approved.
+    ///
+    /// **Use only for bootstrapping** (e.g. building the approval WASM before
+    /// the approval mechanism exists). Set `security.creation_gate = "policy_only"`
+    /// in girt.toml. Switch back to `"llm"` after the bootstrap artifact is built.
+    pub fn with_policy_only_creation(
+        execution_evaluator: Box<dyn crate::layers::llm::LlmEvaluator>,
+    ) -> Self {
+        Self {
+            creation_layers: CreationLayers {
+                policy: PolicyRulesLayer::with_defaults(),
+                cache: CacheLayer::new(),
+                registry: RegistryLookupLayer::new(vec![]),
+                cli_check: CliCheckLayer::with_defaults(),
+                similarity: SimilarityLayer::new(vec![]),
+                llm: LlmEvaluationLayer::with_allow_all(),
+                hitl: HitlLayer::with_default(),
+            },
+            execution_layers: ExecutionLayers {
+                policy: PolicyRulesLayer::with_defaults(),
+                cache: CacheLayer::new(),
+                llm: LlmEvaluationLayer::new(execution_evaluator),
+                hitl: HitlLayer::with_default(),
+            },
+        }
+    }
+
     /// Create an engine with default/stub layers for development and testing.
     pub fn with_defaults() -> Self {
         Self {

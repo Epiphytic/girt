@@ -2,6 +2,8 @@ use chrono::{DateTime, Utc};
 use girt_core::spec::CapabilitySpec;
 use serde::{Deserialize, Serialize};
 
+use crate::llm::TokenUsage;
+
 /// A capability request in the build queue.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapabilityRequest {
@@ -62,6 +64,10 @@ pub struct RefinedSpec {
     pub design_notes: String,
     pub extend_target: Option<String>,
     pub extend_features: Option<Vec<String>>,
+    /// Architect's explicit complexity signal. When `Some(High)`, the Orchestrator
+    /// runs the Planner before the Engineer regardless of structural triggers.
+    #[serde(default)]
+    pub complexity_hint: Option<ComplexityHint>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +75,35 @@ pub struct RefinedSpec {
 pub enum SpecAction {
     Build,
     RecommendExtend,
+}
+
+/// Complexity signal from the Architect. Determines whether the Planner runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComplexityHint {
+    Low,
+    High,
+}
+
+/// Structured implementation brief produced by the Planner agent.
+///
+/// The Engineer receives this alongside the refined spec. Following the plan
+/// is mandatory; deviations require an explanatory code comment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImplementationPlan {
+    /// All input validation that must occur before any external calls,
+    /// with exact constraints (max lengths, allowed char sets, etc.).
+    pub validation_layer: String,
+    /// Threat model: for each input field, what can an attacker do and
+    /// what mitigations are required (CRLF injection, path traversal, etc.).
+    pub security_notes: String,
+    /// Step-by-step API call sequence with error handling for each step.
+    pub api_sequence: String,
+    /// Identified edge cases and the required handling for each.
+    pub edge_cases: String,
+    /// Language-specific patterns, crate recommendations, and things to avoid
+    /// in WASM+WASI (e.g. std::thread, blocking I/O patterns).
+    pub implementation_guidance: String,
 }
 
 /// Supported build target languages.
@@ -105,10 +140,23 @@ pub struct BuildOutput {
 pub struct BugTicket {
     pub target: String,
     pub ticket_type: BugTicketType,
+    /// Severity tier. Defaults to High when not specified (safe default).
+    #[serde(default)]
+    pub severity: BugTicketSeverity,
     pub input: serde_json::Value,
     pub expected: String,
     pub actual: String,
     pub remediation_directive: String,
+}
+
+impl BugTicket {
+    /// A ticket is blocking (triggers a fix loop) if severity is Critical or High.
+    pub fn is_blocking(&self) -> bool {
+        matches!(
+            self.severity,
+            BugTicketSeverity::Critical | BugTicketSeverity::High
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,6 +164,20 @@ pub struct BugTicket {
 pub enum BugTicketType {
     FunctionalDefect,
     SecurityVulnerability,
+}
+
+/// Severity tier for bug tickets.
+///
+/// Critical and High tickets block the build and trigger Engineer fix loops.
+/// Medium and Low tickets are reported in the artifact but do not block.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BugTicketSeverity {
+    Critical,
+    #[default]
+    High,
+    Medium,
+    Low,
 }
 
 /// QA test results.
@@ -137,6 +199,65 @@ pub struct SecurityResult {
     pub bug_tickets: Vec<BugTicket>,
 }
 
+/// Per-iteration timing + token breakdown (one entry per Engineer→QA→RedTeam cycle).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IterationTimings {
+    pub iteration: u32,
+    pub engineer_ms: u64,
+    pub engineer_tokens: TokenUsage,
+    pub qa_ms: u64,
+    pub qa_tokens: TokenUsage,
+    pub red_team_ms: u64,
+    pub red_team_tokens: TokenUsage,
+}
+
+/// Full timing + token breakdown for a pipeline run.
+///
+/// Use this to identify which stage is the bottleneck and most expensive.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StageTimings {
+    /// Architect phase (spec refinement).
+    pub architect_ms: u64,
+    pub architect_tokens: TokenUsage,
+    /// Planner phase (`None` if skipped for low-complexity specs).
+    pub planner_ms: Option<u64>,
+    pub planner_tokens: Option<TokenUsage>,
+    /// Per-iteration timings (one entry per Engineer→QA→RedTeam cycle).
+    pub iterations: Vec<IterationTimings>,
+    /// Total wall-clock time for the full pipeline run.
+    pub total_ms: u64,
+}
+
+impl StageTimings {
+    pub fn total_engineer_ms(&self) -> u64 {
+        self.iterations.iter().map(|i| i.engineer_ms).sum()
+    }
+    pub fn total_qa_ms(&self) -> u64 {
+        self.iterations.iter().map(|i| i.qa_ms).sum()
+    }
+    pub fn total_red_team_ms(&self) -> u64 {
+        self.iterations.iter().map(|i| i.red_team_ms).sum()
+    }
+    pub fn total_input_tokens(&self) -> u64 {
+        self.architect_tokens.input_tokens
+            + self.planner_tokens.as_ref().map_or(0, |t| t.input_tokens)
+            + self.iterations.iter().map(|i| {
+                i.engineer_tokens.input_tokens
+                    + i.qa_tokens.input_tokens
+                    + i.red_team_tokens.input_tokens
+            }).sum::<u64>()
+    }
+    pub fn total_output_tokens(&self) -> u64 {
+        self.architect_tokens.output_tokens
+            + self.planner_tokens.as_ref().map_or(0, |t| t.output_tokens)
+            + self.iterations.iter().map(|i| {
+                i.engineer_tokens.output_tokens
+                    + i.qa_tokens.output_tokens
+                    + i.red_team_tokens.output_tokens
+            }).sum::<u64>()
+    }
+}
+
 /// The final build artifact ready for publishing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuildArtifact {
@@ -146,6 +267,17 @@ pub struct BuildArtifact {
     pub qa_result: QaResult,
     pub security_result: SecurityResult,
     pub build_iterations: u32,
+    /// Per-stage timing breakdown for this pipeline run.
+    pub timings: StageTimings,
+    /// True if the pipeline hit the iteration limit and proceeded past it
+    /// (on_circuit_breaker = "ask" or "proceed"). The build was shipped
+    /// despite remaining blocking tickets — see escalated_tickets.
+    #[serde(default)]
+    pub escalated: bool,
+    /// Blocking tickets that were unresolved when the pipeline was escalated.
+    /// Empty when escalated = false.
+    #[serde(default)]
+    pub escalated_tickets: Vec<BugTicket>,
 }
 
 /// Wassette policy.yaml content.

@@ -1,5 +1,5 @@
 use crate::error::PipelineError;
-use crate::llm::{LlmClient, LlmMessage, LlmRequest};
+use crate::llm::{LlmClient, LlmMessage, LlmRequest, TokenUsage};
 use crate::types::{BugTicket, BugTicketType, BuildOutput, QaResult, RefinedSpec};
 
 const QA_SYSTEM_PROMPT: &str = r#"You are a QA Automation Engineer. You are given a tool specification and its implementation.
@@ -10,6 +10,19 @@ Generate test cases covering:
 1. Standard use cases (happy path)
 2. Edge cases (empty inputs, boundary values, unicode)
 3. Malformed inputs (wrong types, missing fields, oversized payloads)
+4. Spec contract violations (inputs outside stated bounds, missing required fields)
+
+For each failing test, assign a severity:
+  critical — Input accepted that the spec explicitly forbids AND has security implications
+             (e.g. rejected format bypassed, credential leaked)
+  high     — Significant defect that breaks a correctness guarantee from the spec
+             (e.g. required validation missing, wrong output on valid input)
+  medium   — Edge case or inefficiency unlikely to cause harm in production
+             (e.g. duplicate work, suboptimal error message, unnecessary allocations)
+  low      — Minor inconsistency or best-practice gap with negligible impact
+
+PASS CRITERIA: passed=true when there are no critical or high tickets.
+Medium and low tickets are informational — they do not block the build.
 
 Output ONLY valid JSON:
 {
@@ -21,6 +34,7 @@ Output ONLY valid JSON:
     {
       "target": "engineer",
       "ticket_type": "functional_defect",
+      "severity": "critical|high|medium|low",
       "input": <the failing input>,
       "expected": "what should happen",
       "actual": "what actually happened",
@@ -46,7 +60,7 @@ impl<'a> QaAgent<'a> {
         &self,
         spec: &RefinedSpec,
         build: &BuildOutput,
-    ) -> Result<QaResult, PipelineError> {
+    ) -> Result<(QaResult, TokenUsage), PipelineError> {
         let request = LlmRequest {
             system_prompt: QA_SYSTEM_PROMPT.into(),
             messages: vec![LlmMessage {
@@ -59,10 +73,11 @@ impl<'a> QaAgent<'a> {
                     build.policy_yaml,
                 ),
             }],
-            max_tokens: 2000,
+            max_tokens: 16_000,
         };
 
         let response = self.llm.chat(&request).await?;
+        let usage = response.usage.clone();
 
         let result: QaResult = match super::extract_json(&response.content) {
             Some(r) => r,
@@ -84,13 +99,13 @@ impl<'a> QaAgent<'a> {
         tracing::info!(
             passed = result.passed,
             tests_run = result.tests_run,
-            tests_passed = result.tests_passed,
-            tests_failed = result.tests_failed,
             bug_tickets = result.bug_tickets.len(),
+            input_tokens = usage.input_tokens,
+            output_tokens = usage.output_tokens,
             "QA testing complete"
         );
 
-        Ok(result)
+        Ok((result, usage))
     }
 
     /// Create a passing QA result for testing.
@@ -114,6 +129,7 @@ impl<'a> QaAgent<'a> {
             bug_tickets: vec![BugTicket {
                 target: "engineer".into(),
                 ticket_type: BugTicketType::FunctionalDefect,
+                severity: crate::types::BugTicketSeverity::High,
                 input: serde_json::json!({"test": "failing_input"}),
                 expected: "correct output".into(),
                 actual: "incorrect output".into(),
@@ -143,6 +159,7 @@ mod tests {
             design_notes: "test".into(),
             extend_target: None,
             extend_features: None,
+            complexity_hint: None,
         };
         let build = BuildOutput {
             source_code: "fn main() {}".into(),
@@ -167,7 +184,7 @@ mod tests {
         let agent = QaAgent::new(&client);
         let (spec, build) = make_test_context();
 
-        let result = agent.test(&spec, &build).await.unwrap();
+        let (result, _) = agent.test(&spec, &build).await.unwrap();
         assert!(result.passed);
         assert_eq!(result.tests_run, 5);
         assert!(result.bug_tickets.is_empty());
@@ -194,7 +211,7 @@ mod tests {
         let agent = QaAgent::new(&client);
         let (spec, build) = make_test_context();
 
-        let result = agent.test(&spec, &build).await.unwrap();
+        let (result, _) = agent.test(&spec, &build).await.unwrap();
         assert!(!result.passed);
         assert_eq!(result.bug_tickets.len(), 1);
         assert_eq!(

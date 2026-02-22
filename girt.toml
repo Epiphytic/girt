@@ -5,7 +5,7 @@
 #   "stub"              — Deterministic no-op for testing
 provider = "anthropic"
 model = "claude-sonnet-4-5"
-max_tokens = 4096
+max_tokens = 64000
 
 # Credential resolution order (anthropic provider):
 #   1. ANTHROPIC_API_KEY environment variable
@@ -19,6 +19,28 @@ max_tokens = 4096
 # base_url = "http://localhost:8000/v1"
 # model = "zai-org/GLM-4.7-Flash"
 
+[security]
+# "llm"         — full LLM + HITL approval for every new tool (default)
+# "policy_only" — policy rules enforced, LLM gate bypassed (bootstrap only)
+creation_gate = "llm"
+
+[approval]
+# discord_approval WASM routes Ask decisions to this channel
+channel_id = "1474625611908513823"
+guild_id   = "1473159530316566551"
+# Usernames allowed to approve/deny (empty = anyone in the channel)
+authorized_users = ["liamhelmer"]
+# Per-WASM-invocation polling budget (≤60s — WASM returns pending if no reaction within this window)
+timeout_secs = 55
+# Overall approval deadline. Default: 259200 (3 days). Approval fails if no human responds by then.
+overall_timeout_secs = 259200
+# Exponential backoff between WASM re-invocations.
+# Starts at initial_poll_interval_secs, doubles each pending cycle, caps at max_poll_interval_secs.
+initial_poll_interval_secs = 10   # first re-invoke after 10s
+poll_backoff_multiplier    = 2.0  # double each cycle: 10s → 20s → 40s → ... → 3600s
+max_poll_interval_secs     = 3600 # cap at 1 hour
+# bot_token injected from DISCORD_BOT_TOKEN env (read from OpenClaw config at startup)
+
 [pipeline]
 # Path to a coding standards / conventions file.
 # Its contents are injected into the Engineer agent's system prompt so
@@ -26,9 +48,26 @@ max_tokens = 4096
 # Supports ~ expansion. Leave commented to disable.
 coding_standards_path = "~/.openclaw/workspace/CLAUDE.md"
 
+# Maximum Engineer → QA/RedTeam iterations before the circuit breaker triggers.
+# Default: 3. Increase for complex security-sensitive components.
+max_iterations = 3
+# Hard wall on active build time (LLM calls + compilation). Approval wait time is NOT counted.
+# The clock starts only after an approval is granted. Default: 3600 (1 hour).
+build_timeout_secs = 3600
+# What to do when the fix loop exhausts max_iterations with blocking tickets remaining.
+# ask     = escalate to human for a decision (future: via approval WASM; now: falls back to proceed)
+# proceed = ship the build with remaining tickets logged in the artifact (fail open)
+# fail    = abort with an error (previous behaviour)
+on_circuit_breaker = "proceed"
+
 [registry]
+# Source repository for syncing built tool code (optional)
+source_repo = "https://github.com/Epiphytic/girt-tools"
+# local_path defaults to ~/.girt/tool-registry
 url = "ghcr.io/epiphytic/girt-tools"
 
 [build]
 default_language = "rust"
 default_tier = "standard"
+# Full path needed when girt runs as a daemon without ~/.cargo/bin on PATH
+cargo_component_bin = "/home/openclaw/.cargo/bin/cargo-component"

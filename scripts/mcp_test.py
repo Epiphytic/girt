@@ -26,14 +26,39 @@ def recv(timeout=30):
     return json.loads(raw.decode().strip())
 
 def main():
+    # This is what a calling agent would actually write — high-level intent only.
+    # The Architect decides implementation details, security requirements, API choices.
     spec = {
-        "name": "add_two_numbers",
+        "name": "discord_approval",
         "description": (
-            "Add two numbers. Takes JSON with 'a' and 'b' (numbers), "
-            "returns JSON with 'result' (number). Pure arithmetic, no I/O."
+            "Request human approval via a Discord channel. "
+            "Post a question and wait for a user to react with thumbs up (approve) "
+            "or thumbs down (deny). "
+            "Supports re-invocation with a message_id to continue polling "
+            "without re-posting the question."
         ),
-        "inputs": {"a": "number", "b": "number"},
-        "outputs": {"result": "number"},
+        "inputs": {
+            "question": "string — the question to ask",
+            "context": "string — optional additional context shown with the question",
+            "channel_id": "string — Discord channel ID",
+            "guild_id": "string — Discord guild ID (for the message permalink)",
+            "bot_token": "string — Discord bot token",
+            "authorized_users": "array of strings — usernames allowed to respond; empty means anyone",
+            "timeout_secs": "number — seconds to poll before returning pending",
+            "message_id": "string — optional; resume token from a previous invocation"
+        },
+        "outputs": {
+            "status": "string — approved, denied, or pending",
+            "message_id": "string — pass back on re-invocation to continue polling",
+            "approved": "bool",
+            "authorized_by": "string — Discord username of responder",
+            "evidence_url": "string — permalink to the Discord message"
+        },
+        "constraints": {
+            "network": ["discord.com"],
+            "storage": [],
+            "secrets": []
+        }
     }
 
     print(f"[bel] Starting girt: {GIRT_BIN}", flush=True)
@@ -91,7 +116,7 @@ def main():
             "params": {"name": "request_capability", "arguments": spec},
         })
 
-        resp = recv(timeout=360)
+        resp = recv(timeout=720)
         elapsed = time.time() - t0
 
         content = resp.get("result", {}).get("content", [{}])
@@ -106,6 +131,25 @@ def main():
                 print(f"  build_iterations : {parsed.get('build_iterations')}", flush=True)
                 print(f"  tests            : {parsed.get('tests_passed')}/{parsed.get('tests_run')}", flush=True)
                 print(f"  exploits blocked : {parsed.get('exploits_attempted')} attempted, {parsed.get('exploits_succeeded')} succeeded", flush=True)
+                if parsed.get("escalated"):
+                    tickets = parsed.get("escalated_tickets", [])
+                    print(f"  ⚠ ESCALATED: proceeded past circuit breaker with {len(tickets)} unresolved ticket(s):", flush=True)
+                    for t in tickets:
+                        print(f"    [{t.get('severity','?')}/{t.get('ticket_type','?')}] {t.get('actual','')}", flush=True)
+                t = parsed.get("timings", {})
+                if t:
+                    def tok(u): return f"{u.get('input_tokens',0)}in/{u.get('output_tokens',0)}out" if u else "n/a"
+                    iters = t.get("iterations", [])
+                    print(f"  ── stage timings + tokens ───────────────────", flush=True)
+                    print(f"  architect  : {t.get('architect_ms', 0)}ms  {tok(t.get('architect_tokens'))}", flush=True)
+                    pm, pt = t.get("planner_ms"), t.get("planner_tokens")
+                    print(f"  planner    : {pm}ms  {tok(pt)}" if pm else "  planner    : skipped", flush=True)
+                    for it in iters:
+                        print(f"  iter {it['iteration']}:", flush=True)
+                        print(f"    engineer : {it['engineer_ms']}ms  {tok(it.get('engineer_tokens'))}", flush=True)
+                        print(f"    qa       : {it['qa_ms']}ms  {tok(it.get('qa_tokens'))}", flush=True)
+                        print(f"    red_team : {it['red_team_ms']}ms  {tok(it.get('red_team_tokens'))}", flush=True)
+                    print(f"  total      : {t.get('total_ms', 0)}ms", flush=True)
 
                 # verify new tool appears
                 send(proc, {"jsonrpc": "2.0", "id": 4, "method": "tools/list", "params": {}})

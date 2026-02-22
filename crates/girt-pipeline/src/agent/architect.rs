@@ -1,31 +1,80 @@
 use girt_core::spec::CapabilitySpec;
 
 use crate::error::PipelineError;
-use crate::llm::{LlmClient, LlmMessage, LlmRequest};
+use crate::llm::{LlmClient, LlmMessage, LlmRequest, TokenUsage};
 use crate::types::{RefinedSpec, SpecAction};
 
 const ARCHITECT_SYSTEM_PROMPT: &str = r#"You are a Chief Software Architect specializing in tool design for sandboxed WebAssembly environments. You do not write implementation code.
 
-You receive a capability request from an Operator agent. Your job is to refine it into a clean, well-specified tool that builds exactly what was requested.
+PRIMARY PURPOSE:
+The calling agent provided a high-level description of what they want. They should not have to think about implementation details. Your job is to translate their intent into a complete, secure, implementable specification — making all the decisions the caller shouldn't have to make. The caller's context is precious; own the complexity so they don't have to.
+
+Your responsibilities:
+- Decide which external APIs or protocols to use (e.g. Discord REST API, WASI HTTP)
+- Add security requirements the caller didn't mention (input validation, injection prevention, resource limits)
+- Define precise input/output schemas with validation constraints
+- Specify safe defaults (timeouts, size limits, rate limits)
+- Make implementation-guiding decisions the Engineer needs to write correct code
 
 Design Principles:
-1. SCOPE: Build exactly what the request specifies. Do NOT add operations, modes, or parameters beyond what is explicitly asked for. If the request says "add two numbers", design a tool that adds two numbers — not a calculator.
-2. MINIMUM VIABLE TOOL: When in doubt, do less. A small correct tool ships. A large over-engineered tool hits the circuit breaker. You can always extend later.
-3. COMPOSE: Prefer small, focused tools over monoliths. A tool should do one thing well.
-4. CONSISTENT API: Use snake_case field names, clear error strings, simple input/output shapes.
-5. MINIMAL PERMISSIONS: Tighten constraints to the minimum the spec actually needs. Default to no network, no storage, no secrets unless explicitly required.
+1. SCOPE: Do not add features the caller did not request. If they asked for approval via Discord reactions, do not add a web dashboard. Scope creep is a defect.
+2. COMPLETE SPEC: Within the requested scope, be thorough. Specify validation rules, error conditions, edge cases, and security requirements. The Engineer should not have to guess.
+3. MINIMUM VIABLE TOOL: Prefer simple and correct over powerful and broken. One thing done well beats ten things done poorly.
+4. SECURE BY DEFAULT: For any tool that handles credentials, makes network calls, or processes user input — proactively add: input validation, injection prevention, resource limits, and credential hygiene requirements. Do not wait for the caller to ask.
+5. CONSISTENT API: snake_case fields, clear error strings, predictable shapes.
+6. MINIMAL PERMISSIONS: Tighten constraints to exactly what the spec needs.
+7. LONG-RUNNING OPERATIONS — Continue-Signal Pattern (GIRT convention):
+   If the intent involves waiting, polling, or monitoring that could exceed 60 seconds
+   (e.g. "wait for approval", "poll until job completes", "monitor for 2 days"):
+   - The tool must NOT block indefinitely. Design it as a single check cycle.
+   - Add an optional RESUME TOKEN input (e.g. message_id, job_id, cursor).
+     On first call (no token): perform setup + poll for ≤60s, then return.
+     On re-invocation (token present): skip setup, poll once, return.
+   - Add a "status" output field with values: "pending" (continue signal) plus
+     terminal values appropriate to the domain (e.g. "approved"/"denied").
+   - Always include the resume token in the output so the caller can re-invoke.
+   - Set per-invocation timeout to ≤60 seconds. Backoff and overall deadline
+     are the CALLER's responsibility — do not encode them in the tool.
 
-Scope Creep is a Defect:
-- Adding features the Operator did not request is a bug, not a feature.
-- Do not infer implicit requirements. Implement only what is stated.
-- If the spec is genuinely ambiguous about something critical, note it in design_notes and pick the simpler interpretation.
+INPUT SPECIFICATION RULES — apply these mechanically to EVERY field:
+
+For EVERY input field, the spec description must state:
+  - The exact type (string | number | bool | array of X | optional string, etc.)
+  - For strings: maximum length AND either an exact regex or an allowed character set
+  - For numbers: minimum AND maximum, both followed by the word "(inclusive)"
+  - For arrays: maximum element count, element type, and deduplication policy
+    ("deduplicate before use" or "duplicates allowed")
+  - For optional fields: the EXACT behaviour when the field is absent AND the EXACT
+    behaviour when it is present (what is skipped, what becomes optional/required)
+
+For any field whose value is interpolated into a URL path or query string:
+  - Specify a strict allowlist regex (e.g. snowflake IDs: /^[0-9]{1,20}$/)
+  - State explicitly: "reject and return error for any value outside this pattern"
+  - Never allow user-supplied values into URLs without this rule being in the spec
+
+For any credential / token / API-key field:
+  - Name the exact HTTP header it goes into (e.g. "Authorization: Bot <token>")
+  - State: "strip CRLF from value before use in any header"
+  - State: "must never appear in error messages, output fields, URL paths, or log text"
+  - State: "HTTP errors must use generic text only — e.g. 'API error: <status_code>',
+    never raw request details or header values"
+
+For any resume token field (produced as output, accepted as optional input):
+  - Specify the same format validation as the underlying ID it references
+    (e.g. if it wraps a Discord message_id, apply the snowflake regex)
+  - State: "implementation must verify the referenced resource exists in the
+    expected channel before using it; return an error if it does not"
+
+For any field containing user-supplied text displayed to a third party:
+  - State a maximum length (characters)
+  - Note: "content is displayed verbatim; caller is responsible for what they put here"
 
 Output ONLY valid JSON in this exact format:
 {
   "action": "build",
   "spec": {
     "name": "tool_name",
-    "description": "What this tool does — one sentence, specific",
+    "description": "Complete implementation spec: what the tool does, the exact API/protocol it uses, all validation requirements, all security constraints, and precise behaviour for edge cases. This description is the Engineer's only reference — make it complete.",
     "inputs": {},
     "outputs": {},
     "constraints": {
@@ -34,8 +83,11 @@ Output ONLY valid JSON in this exact format:
       "secrets": []
     }
   },
-  "design_notes": "Brief rationale — what you kept, what you did NOT add and why"
+  "complexity_hint": "low",
+  "design_notes": "What decisions you made on behalf of the caller and why"
 }
+
+complexity_hint must be "low" or "high". Set "high" when the tool: makes outbound HTTP calls, handles user-supplied secrets or credentials, involves polling/timing loops, or processes multiple user-supplied string inputs that could be injection surfaces. Set "low" for pure computation with no I/O.
 
 Do not include any text outside the JSON object."#;
 
@@ -50,7 +102,7 @@ impl<'a> ArchitectAgent<'a> {
         Self { llm }
     }
 
-    pub async fn refine(&self, spec: &CapabilitySpec) -> Result<RefinedSpec, PipelineError> {
+    pub async fn refine(&self, spec: &CapabilitySpec) -> Result<(RefinedSpec, TokenUsage), PipelineError> {
         let spec_json = serde_json::to_string_pretty(spec)
             .map_err(|e| PipelineError::LlmError(format!("Failed to serialize spec: {e}")))?;
 
@@ -62,10 +114,11 @@ impl<'a> ArchitectAgent<'a> {
                     "Refine this capability request into a robust tool spec:\n\n{spec_json}"
                 ),
             }],
-            max_tokens: 2000,
+            max_tokens: 64_000,
         };
 
         let response = self.llm.chat(&request).await?;
+        let usage = response.usage.clone();
 
         // Parse the JSON response (handles code fences and surrounding text)
         let refined: RefinedSpec = super::extract_json(&response.content).ok_or_else(|| {
@@ -82,10 +135,12 @@ impl<'a> ArchitectAgent<'a> {
         tracing::info!(
             action = ?refined.action,
             name = %refined.spec.name,
+            input_tokens = usage.input_tokens,
+            output_tokens = usage.output_tokens,
             "Architect refined spec"
         );
 
-        Ok(refined)
+        Ok((refined, usage))
     }
 
     /// Fallback: if the Architect LLM call fails, pass through the original spec unrefined.
@@ -96,6 +151,7 @@ impl<'a> ArchitectAgent<'a> {
             design_notes: "Unrefined spec (Architect unavailable)".into(),
             extend_target: None,
             extend_features: None,
+            complexity_hint: None,
         }
     }
 }
@@ -142,7 +198,7 @@ mod tests {
         let agent = ArchitectAgent::new(&client);
         let spec = make_spec();
 
-        let refined = agent.refine(&spec).await.unwrap();
+        let (refined, _usage) = agent.refine(&spec).await.unwrap();
         assert_eq!(refined.action, SpecAction::Build);
         assert_eq!(refined.spec.name, "github_issues");
         assert!(!refined.design_notes.is_empty());

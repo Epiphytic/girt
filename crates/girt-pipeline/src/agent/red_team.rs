@@ -1,5 +1,5 @@
 use crate::error::PipelineError;
-use crate::llm::{LlmClient, LlmMessage, LlmRequest};
+use crate::llm::{LlmClient, LlmMessage, LlmRequest, TokenUsage};
 use crate::types::{BugTicket, BugTicketType, BuildOutput, RefinedSpec, SecurityResult};
 
 const RED_TEAM_SYSTEM_PROMPT: &str = r#"You are an Offensive Security Researcher. You are given a WASM component's source code and its policy.yaml (declared permissions).
@@ -9,10 +9,31 @@ Your Mission: Attempt to find security vulnerabilities in the component.
 Attack vectors to evaluate:
 - SSRF: URL-handling logic hitting disallowed hosts (cloud metadata, localhost)
 - Path traversal: ../../../etc/shadow or equivalent
-- Prompt injection: If the tool processes text, can instructions subvert behavior?
+- Header/CRLF injection: newlines in string inputs reaching HTTP headers
+- Credential leakage: tokens/keys appearing in error messages, URLs, or output fields
 - Permission escalation: Access to storage/network/env beyond policy.yaml
-- Resource exhaustion: Unbounded memory or CPU from crafted inputs
+- Resource exhaustion: Unbounded memory, CPU, or HTTP calls from crafted inputs
 - Data exfiltration: Leaking input data through allowed channels
+- Input validation bypass: Inputs outside spec bounds that are accepted without error
+- Prompt injection: If the tool processes text, can instructions subvert automated pipelines?
+
+For each finding, assign a severity tier:
+  critical — Directly and reliably exploitable in production; immediate risk of data
+             breach, credential theft, or system compromise. Requires an active fix.
+             Examples: CRLF injection into real HTTP headers, auth bypass, RCE.
+  high     — Clear exploit path under specific but realistic conditions.
+             Examples: path traversal accepted, token visible in error output,
+             missing validation on a security-critical field (snowflake ID in URL).
+  medium   — Requires attacker control of multiple parameters, or impact is limited
+             by other mitigations already in place (e.g. NetworkPolicy blocks SSRF).
+             Examples: social engineering via user-controlled display content,
+             phishing text in a field that reaches human approvers.
+  low      — Theoretical risk, hard to exploit in practice, or fully mitigated
+             by the runtime sandbox. Report it, but do not require a fix.
+             Examples: verbose error text, minor information disclosure.
+
+PASS CRITERIA: passed=true when there are no critical or high findings.
+Medium and low findings are informational — they do not block the build.
 
 Output ONLY valid JSON:
 {
@@ -23,6 +44,7 @@ Output ONLY valid JSON:
     {
       "target": "engineer",
       "ticket_type": "security_vulnerability",
+      "severity": "critical|high|medium|low",
       "input": <the exploit input>,
       "expected": "what should be blocked",
       "actual": "what actually happened",
@@ -48,7 +70,7 @@ impl<'a> RedTeamAgent<'a> {
         &self,
         spec: &RefinedSpec,
         build: &BuildOutput,
-    ) -> Result<SecurityResult, PipelineError> {
+    ) -> Result<(SecurityResult, TokenUsage), PipelineError> {
         let request = LlmRequest {
             system_prompt: RED_TEAM_SYSTEM_PROMPT.into(),
             messages: vec![LlmMessage {
@@ -60,10 +82,11 @@ impl<'a> RedTeamAgent<'a> {
                     serde_json::to_string_pretty(&spec.spec).unwrap_or_default(),
                 ),
             }],
-            max_tokens: 2000,
+            max_tokens: 16_000,
         };
 
         let response = self.llm.chat(&request).await?;
+        let usage = response.usage.clone();
 
         let result: SecurityResult = match super::extract_json(&response.content) {
             Some(r) => r,
@@ -84,12 +107,13 @@ impl<'a> RedTeamAgent<'a> {
         tracing::info!(
             passed = result.passed,
             exploits_attempted = result.exploits_attempted,
-            exploits_succeeded = result.exploits_succeeded,
             bug_tickets = result.bug_tickets.len(),
+            input_tokens = usage.input_tokens,
+            output_tokens = usage.output_tokens,
             "Red Team audit complete"
         );
 
-        Ok(result)
+        Ok((result, usage))
     }
 
     /// Create a passing security result for testing.
@@ -111,6 +135,7 @@ impl<'a> RedTeamAgent<'a> {
             bug_tickets: vec![BugTicket {
                 target: "engineer".into(),
                 ticket_type: BugTicketType::SecurityVulnerability,
+                severity: crate::types::BugTicketSeverity::High,
                 input: serde_json::json!({"exploit": "payload"}),
                 expected: "request should be blocked".into(),
                 actual: "request succeeded".into(),
@@ -140,6 +165,7 @@ mod tests {
             design_notes: "test".into(),
             extend_target: None,
             extend_features: None,
+            complexity_hint: None,
         };
         let build = BuildOutput {
             source_code: "fn main() {}".into(),
@@ -163,7 +189,7 @@ mod tests {
         let agent = RedTeamAgent::new(&client);
         let (spec, build) = make_test_context();
 
-        let result = agent.audit(&spec, &build).await.unwrap();
+        let (result, _) = agent.audit(&spec, &build).await.unwrap();
         assert!(result.passed);
         assert_eq!(result.exploits_succeeded, 0);
         assert!(result.bug_tickets.is_empty());
@@ -189,7 +215,7 @@ mod tests {
         let agent = RedTeamAgent::new(&client);
         let (spec, build) = make_test_context();
 
-        let result = agent.audit(&spec, &build).await.unwrap();
+        let (result, _) = agent.audit(&spec, &build).await.unwrap();
         assert!(!result.passed);
         assert_eq!(result.exploits_succeeded, 1);
         assert_eq!(result.bug_tickets.len(), 1);

@@ -149,6 +149,7 @@ mod tests {
                 design_notes: "test".into(),
                 extend_target: None,
                 extend_features: None,
+                complexity_hint: None,
             },
             build_output: BuildOutput {
                 source_code: "fn main() {}".into(),
@@ -170,6 +171,9 @@ mod tests {
                 bug_tickets: vec![],
             },
             build_iterations: 1,
+            timings: Default::default(),
+            escalated: false,
+            escalated_tickets: vec![],
         }
     }
 

@@ -20,10 +20,41 @@ pub struct LlmRequest {
     pub max_tokens: u32,
 }
 
-/// Response from an LLM.
+/// Token usage for a single LLM call.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct TokenUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+impl TokenUsage {
+    pub fn total(&self) -> u64 {
+        self.input_tokens + self.output_tokens
+    }
+}
+
+impl std::ops::Add for TokenUsage {
+    type Output = TokenUsage;
+    fn add(self, other: TokenUsage) -> TokenUsage {
+        TokenUsage {
+            input_tokens: self.input_tokens + other.input_tokens,
+            output_tokens: self.output_tokens + other.output_tokens,
+        }
+    }
+}
+
+impl std::ops::AddAssign for TokenUsage {
+    fn add_assign(&mut self, other: TokenUsage) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+    }
+}
+
+/// Response from an LLM call.
 #[derive(Debug, Clone)]
 pub struct LlmResponse {
     pub content: String,
+    pub usage: TokenUsage,
 }
 
 /// Facade trait for LLM providers.
@@ -112,7 +143,12 @@ impl LlmClient for OpenAiCompatibleClient {
                 })?
                 .to_string();
 
-            Ok(LlmResponse { content })
+            let usage = TokenUsage {
+                input_tokens: json["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
+                output_tokens: json["usage"]["completion_tokens"].as_u64().unwrap_or(0),
+            };
+
+            Ok(LlmResponse { content, usage })
         })
     }
 }
@@ -290,7 +326,12 @@ impl LlmClient for AnthropicLlmClient {
                 })?
                 .to_string();
 
-            Ok(LlmResponse { content })
+            let usage = TokenUsage {
+                input_tokens: json["usage"]["input_tokens"].as_u64().unwrap_or(0),
+                output_tokens: json["usage"]["output_tokens"].as_u64().unwrap_or(0),
+            };
+
+            Ok(LlmResponse { content, usage })
         })
     }
 }
@@ -329,7 +370,7 @@ impl LlmClient for StubLlmClient {
             } else {
                 self.responses[idx % self.responses.len()].clone()
             };
-            Ok(LlmResponse { content: response })
+            Ok(LlmResponse { content: response, usage: TokenUsage::default() })
         })
     }
 }

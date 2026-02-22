@@ -1,6 +1,6 @@
 use crate::error::PipelineError;
-use crate::llm::{LlmClient, LlmMessage, LlmRequest};
-use crate::types::{BugTicket, BuildOutput, PolicyYaml, RefinedSpec, TargetLanguage};
+use crate::llm::{LlmClient, LlmMessage, LlmRequest, TokenUsage};
+use crate::types::{BugTicket, BuildOutput, ImplementationPlan, PolicyYaml, RefinedSpec, TargetLanguage};
 
 const ENGINEER_RUST_PROMPT: &str = r#"You are a Senior Backend Engineer. You write functions that compile to wasm32-wasi Components and run inside girt-runtime, a Wasmtime-based WASM sandbox.
 
@@ -51,6 +51,26 @@ Environment Constraints:
 - Network access is restricted to hosts listed in the spec's constraints.
 - SECRETS: Never hardcode credentials. Call host_auth_proxy(service_name) to get authenticated responses.
 - Available crate dependencies: serde, serde_json (wit-bindgen-rt is already included).
+
+Long-Running Operations — Continue-Signal Pattern (GIRT convention):
+If the spec involves waiting, polling, or monitoring (e.g. "wait for approval",
+"poll until complete", "retry for up to 2 days"), you MUST implement the
+continue-signal pattern. Never implement a blocking loop for the full duration.
+
+Rules:
+- Per-invocation wall-clock budget: ≤60 seconds total. Hard limit.
+- Fixed poll interval: 5–15 seconds. Do NOT vary it — backoff is the caller's job.
+- Maximum polls per invocation = budget ÷ interval (e.g. 60s / 10s = 6 iterations).
+- If the operation is not complete when the budget expires, return immediately
+  with status="pending" and a RESUME TOKEN (the identifier needed to pick up
+  where you left off — e.g. message_id, job_id, cursor).
+- The input struct must have an optional resume token field. On re-invocation
+  (token present), skip setup (skip posting, skip job creation) and go straight
+  to checking status.
+- The output struct must always include: status (string: "pending" or a terminal
+  value like "approved"/"denied") and the resume token.
+- The caller owns the retry loop, overall deadline, and backoff. The WASM has
+  no opinion on how many times it will be re-invoked.
 
 Output ONLY valid JSON in this exact format:
 {
@@ -132,6 +152,11 @@ pub struct EngineerAgent<'a> {
     /// Optional coding standards injected into every system prompt.
     /// Loaded from `pipeline.coding_standards_path` in girt.toml.
     coding_standards: Option<String>,
+    /// Token budget for LLM responses. Complex WASM components need 8000+.
+    max_tokens: u32,
+    /// Optional implementation plan from the Planner agent. When present,
+    /// injected into the build and fix prompts as the authoritative reference.
+    implementation_plan: Option<ImplementationPlan>,
 }
 
 impl<'a> EngineerAgent<'a> {
@@ -140,6 +165,8 @@ impl<'a> EngineerAgent<'a> {
             llm,
             target: TargetLanguage::default(),
             coding_standards: None,
+            max_tokens: 64000,
+            implementation_plan: None,
         }
     }
 
@@ -148,12 +175,30 @@ impl<'a> EngineerAgent<'a> {
             llm,
             target,
             coding_standards: None,
+            max_tokens: 64000,
+            implementation_plan: None,
         }
     }
 
     /// Attach coding standards to be injected into the system prompt.
     pub fn with_standards(mut self, standards: Option<String>) -> Self {
         self.coding_standards = standards;
+        self
+    }
+
+    /// Override the token budget (default: 8192).
+    pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
+        self.max_tokens = max_tokens;
+        self
+    }
+
+    /// Attach an implementation plan from the Planner agent.
+    ///
+    /// When set, the plan is injected into every build and fix prompt as the
+    /// authoritative implementation reference. The Engineer must follow the
+    /// plan's validation strategy and API sequence.
+    pub fn with_plan(mut self, plan: Option<ImplementationPlan>) -> Self {
+        self.implementation_plan = plan;
         self
     }
 
@@ -187,22 +232,48 @@ impl<'a> EngineerAgent<'a> {
         }
     }
 
+    /// Format the implementation plan section for injection into prompts.
+    fn plan_section(&self) -> Option<String> {
+        self.implementation_plan.as_ref().map(|plan| {
+            format!(
+                "\n\nImplementation Plan (authoritative — follow exactly; note any deviation in a code comment):\n\
+                 Validation Layer: {}\n\
+                 Security Notes: {}\n\
+                 API Sequence: {}\n\
+                 Edge Cases: {}\n\
+                 Implementation Guidance: {}",
+                plan.validation_layer,
+                plan.security_notes,
+                plan.api_sequence,
+                plan.edge_cases,
+                plan.implementation_guidance,
+            )
+        })
+    }
+
     /// Generate initial code from a refined spec.
-    pub async fn build(&self, spec: &RefinedSpec) -> Result<BuildOutput, PipelineError> {
+    pub async fn build(&self, spec: &RefinedSpec) -> Result<(BuildOutput, TokenUsage), PipelineError> {
         let spec_json = serde_json::to_string_pretty(spec)
             .map_err(|e| PipelineError::LlmError(format!("Failed to serialize spec: {e}")))?;
+
+        let plan_text = self.plan_section().unwrap_or_default();
+        let content = format!(
+            "Implement this tool spec as a WASM Component:{plan_text}\n\nSpec:\n{spec_json}"
+        );
 
         let request = LlmRequest {
             system_prompt: self.system_prompt(),
             messages: vec![LlmMessage {
                 role: "user".into(),
-                content: format!("Implement this tool spec as a WASM Component:\n\n{spec_json}"),
+                content,
             }],
-            max_tokens: 4000,
+            max_tokens: self.max_tokens,
         };
 
         let response = self.llm.chat(&request).await?;
-        self.parse_build_output(&response.content, spec)
+        let usage = response.usage.clone();
+        let output = self.parse_build_output(&response.content, spec)?;
+        Ok((output, usage))
     }
 
     /// Fix code based on a bug ticket.
@@ -211,26 +282,72 @@ impl<'a> EngineerAgent<'a> {
         spec: &RefinedSpec,
         previous_output: &BuildOutput,
         ticket: &BugTicket,
-    ) -> Result<BuildOutput, PipelineError> {
+    ) -> Result<(BuildOutput, TokenUsage), PipelineError> {
         let ticket_json = serde_json::to_string_pretty(ticket)
             .map_err(|e| PipelineError::LlmError(format!("Failed to serialize ticket: {e}")))?;
+
+        let plan_text = self.plan_section().unwrap_or_default();
+        let content = format!(
+            "Original spec:\n{}{plan_text}\n\nPrevious code:\n{}\n\nBug ticket:\n{}",
+            serde_json::to_string_pretty(spec).unwrap_or_default(),
+            previous_output.source_code,
+            ticket_json,
+        );
 
         let request = LlmRequest {
             system_prompt: self.fix_prompt(),
             messages: vec![LlmMessage {
                 role: "user".into(),
-                content: format!(
-                    "Original spec:\n{}\n\nPrevious code:\n{}\n\nBug ticket:\n{}",
-                    serde_json::to_string_pretty(spec).unwrap_or_default(),
-                    previous_output.source_code,
-                    ticket_json,
-                ),
+                content,
             }],
-            max_tokens: 4000,
+            max_tokens: self.max_tokens,
         };
 
         let response = self.llm.chat(&request).await?;
-        self.parse_build_output(&response.content, spec)
+        let usage = response.usage.clone();
+        let output = self.parse_build_output(&response.content, spec)?;
+        Ok((output, usage))
+    }
+
+    /// Improve an existing tool's source code based on a change request.
+    ///
+    /// Unlike `build` (which generates from scratch), `improve` receives the
+    /// existing source and makes targeted changes.  This is used for:
+    /// - Explicit `improve_tool` MCP calls
+    /// - Auto-triggered when the Architect returns `RecommendExtend`
+    pub async fn improve(
+        &self,
+        spec: &RefinedSpec,
+        existing_source: &str,
+        change_request: &str,
+    ) -> Result<(BuildOutput, TokenUsage), PipelineError> {
+        let spec_json = serde_json::to_string_pretty(spec)
+            .map_err(|e| PipelineError::LlmError(format!("Failed to serialize spec: {e}")))?;
+
+        let plan_text = self.plan_section().unwrap_or_default();
+        let content = format!(
+            "You are improving an existing WASM tool.\n\n\
+             Updated spec (authoritative for inputs, outputs, constraints):\n{spec_json}{plan_text}\n\n\
+             Change request: {change_request}\n\n\
+             EXISTING SOURCE (start from this, make targeted changes only):\n\
+             ```rust\n{existing_source}\n```\n\n\
+             Produce the full updated source. Preserve working logic. \
+             Only change what's needed for the improvement.",
+        );
+
+        let request = LlmRequest {
+            system_prompt: self.system_prompt(),
+            messages: vec![LlmMessage {
+                role: "user".into(),
+                content,
+            }],
+            max_tokens: self.max_tokens,
+        };
+
+        let response = self.llm.chat(&request).await?;
+        let usage = response.usage.clone();
+        let output = self.parse_build_output(&response.content, spec)?;
+        Ok((output, usage))
     }
 
     fn parse_build_output(
@@ -281,6 +398,7 @@ mod tests {
             design_notes: "Simple stateless conversion".into(),
             extend_target: None,
             extend_features: None,
+            complexity_hint: None,
         }
     }
 
@@ -297,7 +415,7 @@ mod tests {
         let agent = EngineerAgent::new(&client);
         let spec = make_refined_spec();
 
-        let output = agent.build(&spec).await.unwrap();
+        let (output, _) = agent.build(&spec).await.unwrap();
         assert_eq!(output.language, "rust");
         assert!(output.source_code.contains("convert"));
     }
@@ -308,7 +426,7 @@ mod tests {
         let agent = EngineerAgent::new(&client);
         let spec = make_refined_spec();
 
-        let output = agent.build(&spec).await.unwrap();
+        let (output, _) = agent.build(&spec).await.unwrap();
         assert!(output.source_code.contains("raw code"));
         assert_eq!(output.language, "rust");
     }
@@ -319,7 +437,7 @@ mod tests {
         let agent = EngineerAgent::with_target(&client, TargetLanguage::Go);
         let spec = make_refined_spec();
 
-        let output = agent.build(&spec).await.unwrap();
+        let (output, _) = agent.build(&spec).await.unwrap();
         assert_eq!(output.language, "go");
         assert!(output.source_code.contains("package main"));
     }
@@ -330,7 +448,7 @@ mod tests {
         let agent = EngineerAgent::with_target(&client, TargetLanguage::AssemblyScript);
         let spec = make_refined_spec();
 
-        let output = agent.build(&spec).await.unwrap();
+        let (output, _) = agent.build(&spec).await.unwrap();
         assert_eq!(output.language, "assemblyscript");
     }
 
@@ -347,7 +465,7 @@ mod tests {
         let agent = EngineerAgent::with_target(&client, TargetLanguage::Go);
         let spec = make_refined_spec();
 
-        let output = agent.build(&spec).await.unwrap();
+        let (output, _) = agent.build(&spec).await.unwrap();
         assert_eq!(output.language, "go");
         assert!(output.source_code.contains("Convert"));
     }

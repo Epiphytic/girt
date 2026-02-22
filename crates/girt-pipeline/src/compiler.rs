@@ -6,6 +6,9 @@ use crate::error::PipelineError;
 const DEFAULT_WIT: &str = r#"package girt:tool;
 
 world girt-tool {
+    import wasi:http/outgoing-handler@0.2.0;
+    import wasi:clocks/monotonic-clock@0.2.0;
+
     export run: func(input: string) -> result<string, string>;
 }
 "#;
@@ -31,6 +34,13 @@ impl WasmCompiler {
         Self {
             cargo_component_bin: "cargo-component".into(),
         }
+    }
+
+    /// Override the path to the cargo-component binary.
+    /// Useful when `~/.cargo/bin` is not on PATH (common in daemon contexts).
+    pub fn with_bin(mut self, path: impl Into<String>) -> Self {
+        self.cargo_component_bin = path.into();
+        self
     }
 
     pub fn scaffold_project(

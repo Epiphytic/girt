@@ -9,4 +9,5 @@ pub mod orchestrator;
 pub mod publish;
 pub mod queue;
 pub mod stdlib;
+pub mod tool_sync;
 pub mod types;

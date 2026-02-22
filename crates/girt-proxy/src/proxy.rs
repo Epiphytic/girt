@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use girt_core::decision::{Decision, GateKind};
 use girt_core::engine::DecisionEngine;
@@ -6,8 +7,10 @@ use girt_core::spec::{CapabilitySpec, ExecutionRequest, GateInput};
 use girt_pipeline::llm::LlmClient;
 use girt_pipeline::orchestrator::{Orchestrator, PipelineOutcome};
 use girt_pipeline::publish::Publisher;
+use girt_pipeline::tool_sync::ToolSync;
 use girt_pipeline::types::{CapabilityRequest, RequestSource};
 use girt_runtime::{ComponentMeta, LifecycleManager};
+use crate::approval::ApprovalManager;
 use rmcp::{
     ErrorData as McpError, Peer, RoleServer, ServerHandler,
     model::{
@@ -30,17 +33,40 @@ pub struct GirtProxy {
     runtime: Arc<LifecycleManager>,
     /// Coding standards injected into the Engineer's system prompt.
     coding_standards: Option<String>,
+    /// Circuit breaker iteration limit for the build loop.
+    max_iterations: u32,
+    /// What to do when the iteration limit is reached with blocking tickets remaining.
+    circuit_breaker_policy: girt_pipeline::config::CircuitBreakerPolicy,
+    /// Path to the cargo-component binary.
+    cargo_component_bin: String,
+    /// Human-in-the-loop approval manager (drives discord_approval WASM).
+    /// When present, `Ask` decisions from the Creation Gate are routed here
+    /// instead of being surfaced to the MCP caller.
+    approval_manager: Option<Arc<ApprovalManager>>,
+    /// Optional tool source sync to a git repository.
+    tool_sync: Option<Arc<ToolSync>>,
+    /// Hard wall on active build time (LLM calls + compilation).
+    /// Approval wait time is NOT counted — the clock only runs while the
+    /// pipeline is actually working.
+    build_timeout_secs: u64,
     /// Server peer for sending tools/list_changed notifications.
     server_peer: Arc<Mutex<Option<Peer<RoleServer>>>>,
 }
 
 impl GirtProxy {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         engine: Arc<DecisionEngine>,
         llm: Arc<dyn LlmClient>,
         publisher: Arc<Publisher>,
         runtime: Arc<LifecycleManager>,
         coding_standards: Option<String>,
+        max_iterations: u32,
+        circuit_breaker_policy: girt_pipeline::config::CircuitBreakerPolicy,
+        cargo_component_bin: String,
+        approval_manager: Option<Arc<ApprovalManager>>,
+        tool_sync: Option<Arc<ToolSync>>,
+        build_timeout_secs: u64,
     ) -> Self {
         Self {
             engine,
@@ -48,6 +74,12 @@ impl GirtProxy {
             publisher,
             runtime,
             coding_standards,
+            max_iterations,
+            circuit_breaker_policy,
+            cargo_component_bin,
+            approval_manager,
+            tool_sync,
+            build_timeout_secs,
             server_peer: Arc::new(Mutex::new(None)),
         }
     }
@@ -392,6 +424,71 @@ impl GirtProxy {
                 decision_to_content(&gate_result.decision),
                 true,
             )),
+            Decision::Ask { prompt, context } => {
+                if let Some(ref manager) = self.approval_manager {
+                    // Route through the approval WASM (discord_approval)
+                    let question = format!("{}\n\n{}", prompt, context);
+                    let ctx = serde_json::json!({
+                        "tool_name": spec.name,
+                        "description": spec.description,
+                        "constraints": spec.constraints,
+                    })
+                    .to_string();
+
+                    tracing::info!(
+                        tool = %spec.name,
+                        "Creation Gate returned Ask — routing to discord_approval WASM"
+                    );
+
+                    match manager.request_approval(&question, &ctx).await {
+                        Ok(result) if result.approved => {
+                            tracing::info!(
+                                authorized_by = %result.authorized_by,
+                                evidence_url = %result.evidence_url,
+                                "Human approved — triggering build"
+                            );
+                            self.trigger_build(spec).await
+                        }
+                        Ok(result) => {
+                            tracing::info!(
+                                authorized_by = %result.authorized_by,
+                                "Human denied capability request"
+                            );
+                            Ok(make_tool_result(
+                                vec![Content::text(
+                                    serde_json::json!({
+                                        "status": "denied",
+                                        "reason": "Human denied the capability request",
+                                        "authorized_by": result.authorized_by,
+                                        "evidence_url": result.evidence_url,
+                                    })
+                                    .to_string(),
+                                )],
+                                true,
+                            ))
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "Approval request failed");
+                            Ok(make_tool_result(
+                                vec![Content::text(
+                                    serde_json::json!({
+                                        "status": "approval_failed",
+                                        "error": e,
+                                    })
+                                    .to_string(),
+                                )],
+                                true,
+                            ))
+                        }
+                    }
+                } else {
+                    // No approval manager configured — surface Ask to the MCP caller
+                    Ok(make_tool_result(
+                        decision_to_content(&gate_result.decision),
+                        false,
+                    ))
+                }
+            }
             _ => Ok(make_tool_result(
                 decision_to_content(&gate_result.decision),
                 false,
@@ -411,8 +508,29 @@ impl GirtProxy {
         );
 
         let orchestrator = Orchestrator::new(self.llm.as_ref())
-            .with_standards(self.coding_standards.clone());
-        let outcome = orchestrator.run(&cap_request).await;
+            .with_standards(self.coding_standards.clone())
+            .with_max_iterations(self.max_iterations)
+            .with_circuit_breaker_policy(self.circuit_breaker_policy.clone());
+
+        // Only active build time counts against this limit — approval wait
+        // time is excluded because the clock starts here, after approval.
+        let build_budget = Duration::from_secs(self.build_timeout_secs);
+        let outcome = match tokio::time::timeout(build_budget, orchestrator.run(&cap_request)).await {
+            Ok(outcome) => outcome,
+            Err(_elapsed) => {
+                tracing::error!(
+                    tool = %tool_name,
+                    build_timeout_secs = self.build_timeout_secs,
+                    "Build pipeline exceeded time budget"
+                );
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Build timed out after {}s. \
+                     Approval wait time is not counted — only active pipeline time. \
+                     Consider increasing pipeline.build_timeout_secs in girt.toml.",
+                    self.build_timeout_secs
+                ))]));
+            }
+        };
 
         match outcome {
             PipelineOutcome::Built(artifact) => {
@@ -429,7 +547,8 @@ impl GirtProxy {
                     tool_name: artifact.spec.name.clone(),
                     tool_version: "0.1.0".into(),
                 };
-                let compiler = girt_pipeline::compiler::WasmCompiler::new();
+                let compiler = girt_pipeline::compiler::WasmCompiler::new()
+                    .with_bin(&self.cargo_component_bin);
 
                 match compiler.compile(&compile_input).await {
                     Ok(compiled) => {
@@ -456,6 +575,17 @@ impl GirtProxy {
                                 ));
                             }
                         };
+
+                        // Sync source to tool registry (non-fatal if it fails)
+                        if let Some(ref syncer) = self.tool_sync {
+                            if let Err(e) = syncer.sync(&artifact, &publish_result).await {
+                                tracing::warn!(
+                                    tool = %tool_name,
+                                    error = %e,
+                                    "Tool registry sync failed (continuing)"
+                                );
+                            }
+                        }
 
                         // Load into girt-runtime
                         let wasm_path = publish_result.local_path.join("tool.wasm");
@@ -486,6 +616,9 @@ impl GirtProxy {
                             "tests_passed": artifact.qa_result.tests_passed,
                             "exploits_attempted": artifact.security_result.exploits_attempted,
                             "exploits_succeeded": artifact.security_result.exploits_succeeded,
+                            "escalated": artifact.escalated,
+                            "escalated_tickets": artifact.escalated_tickets,
+                            "timings": artifact.timings,
                         });
                         Ok(make_tool_result(vec![Content::text(response.to_string())], false))
                     }

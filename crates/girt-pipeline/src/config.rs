@@ -15,15 +15,145 @@ pub struct GirtConfig {
     pub build: BuildConfig,
     #[serde(default)]
     pub pipeline: PipelineConfig,
+    #[serde(default)]
+    pub security: SecurityConfig,
+    /// Human-in-the-loop approval configuration (drives discord_approval WASM).
+    /// When present and `creation_gate = "llm"`, ASK decisions are routed
+    /// through the configured approval WASM instead of surfaced to the caller.
+    pub approval: Option<ApprovalConfig>,
+}
+
+/// Configuration for the human-in-the-loop approval WASM.
+///
+/// When set, the proxy calls the approval WASM whenever the Creation Gate
+/// returns `Ask`, rather than surfacing the decision to the MCP caller.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApprovalConfig {
+    /// Tool name of the approval WASM component (default: "discord_approval").
+    #[serde(default = "default_approval_component")]
+    pub component: String,
+    /// Discord channel ID to post approval requests to.
+    pub channel_id: String,
+    /// Discord guild ID (used for evidence URL permalink).
+    pub guild_id: String,
+    /// Bot token. If `None`, read from `$DISCORD_BOT_TOKEN` env var at runtime.
+    pub bot_token: Option<String>,
+    /// Discord usernames allowed to respond (empty list = anyone may respond).
+    #[serde(default)]
+    pub authorized_users: Vec<String>,
+    /// Per-WASM-invocation timeout in seconds (default: 55, must be ≤ 60).
+    /// The WASM returns `pending` if no response arrives within this window;
+    /// the caller (ApprovalManager) re-invokes with the resume token.
+    #[serde(default = "default_approval_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Overall approval deadline in seconds (default: 259200 = 3 days).
+    /// If no human responds before this elapses, the approval request fails.
+    #[serde(default = "default_overall_timeout_secs")]
+    pub overall_timeout_secs: u64,
+    /// Initial delay between WASM re-invocations in seconds (default: 10).
+    /// Doubles after each `pending` response, up to `max_poll_interval_secs`.
+    #[serde(default = "default_initial_poll_interval_secs")]
+    pub initial_poll_interval_secs: u64,
+    /// Multiplier applied to the poll interval after each `pending` response
+    /// (default: 2.0 — exponential doubling).
+    #[serde(default = "default_poll_backoff_multiplier")]
+    pub poll_backoff_multiplier: f64,
+    /// Maximum delay between WASM re-invocations in seconds (default: 3600 = 1 hour).
+    #[serde(default = "default_max_poll_interval_secs")]
+    pub max_poll_interval_secs: u64,
+}
+
+fn default_approval_component() -> String {
+    "discord_approval".to_string()
+}
+fn default_approval_timeout_secs() -> u64 {
+    55
+}
+fn default_overall_timeout_secs() -> u64 {
+    259_200 // 3 days
+}
+fn default_initial_poll_interval_secs() -> u64 {
+    10
+}
+fn default_poll_backoff_multiplier() -> f64 {
+    2.0
+}
+fn default_max_poll_interval_secs() -> u64 {
+    3_600 // 1 hour
+}
+
+/// Security and gate configuration.
+#[derive(Debug, Default, Deserialize)]
+pub struct SecurityConfig {
+    /// Controls Creation Gate evaluation mode:
+    /// - `"llm"` (default): full LLM + HITL approval required
+    /// - `"policy_only"`: policy rules enforced, LLM/HITL bypassed
+    ///   **Use only for bootstrapping** — switch back to "llm" after.
+    #[serde(default = "default_creation_gate")]
+    pub creation_gate: String,
+}
+
+fn default_creation_gate() -> String {
+    "llm".into()
 }
 
 /// Pipeline-level configuration.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct PipelineConfig {
     /// Path to a coding standards file (e.g. ~/.claude/CLAUDE.md).
     /// When set, the contents are injected into the Engineer's system prompt
     /// so generated code follows your project's conventions.
     pub coding_standards_path: Option<String>,
+
+    /// Maximum Engineer → QA/RedTeam iterations before the circuit breaker
+    /// triggers. Default: 3.
+    #[serde(default = "default_max_iterations")]
+    pub max_iterations: u32,
+
+    /// What to do when the fix loop exhausts max_iterations with blocking
+    /// tickets remaining. Default: Ask.
+    #[serde(default)]
+    pub on_circuit_breaker: CircuitBreakerPolicy,
+
+    /// Hard wall on actual build time (LLM calls + compilation) in seconds.
+    /// Approval wait time is excluded — the clock only runs while the pipeline
+    /// is actively working.  Default: 3600 (1 hour).
+    #[serde(default = "default_build_timeout_secs")]
+    pub build_timeout_secs: u64,
+}
+
+/// Policy for when the pipeline fix loop exhausts its iteration budget.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CircuitBreakerPolicy {
+    /// Escalate to a human for a decision.
+    /// Future: routes through the approval WASM.
+    /// Now: falls back to Proceed (fail open) with a warning.
+    #[default]
+    Ask,
+    /// Ship the build with remaining blocking tickets logged in the artifact.
+    /// Fail open — useful in bootstrap mode before an approval mechanism exists.
+    Proceed,
+    /// Abort with an error (original behaviour).
+    Fail,
+}
+
+fn default_max_iterations() -> u32 {
+    3
+}
+fn default_build_timeout_secs() -> u64 {
+    3_600 // 1 hour
+}
+
+impl Default for PipelineConfig {
+    fn default() -> Self {
+        Self {
+            coding_standards_path: None,
+            max_iterations: default_max_iterations(),
+            on_circuit_breaker: CircuitBreakerPolicy::default(),
+            build_timeout_secs: default_build_timeout_secs(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -63,6 +193,13 @@ pub struct RegistryConfig {
     #[serde(default = "default_registry_url")]
     pub url: String,
     pub token: Option<String>,
+    /// Git repository URL to sync tool source into after each successful build.
+    /// When set, GIRT pushes each tool's source, WIT, manifest, and policy
+    /// into `{repo}/{tool_name}/` on the `main` branch.
+    /// Optional — leave unset to disable source sync.
+    pub source_repo: Option<String>,
+    /// Local clone path for the source repo (default: `~/.girt/tool-registry`).
+    pub source_repo_local: Option<String>,
 }
 
 fn default_registry_url() -> String {
@@ -75,6 +212,10 @@ pub struct BuildConfig {
     pub default_language: String,
     #[serde(default = "default_tier")]
     pub default_tier: String,
+    /// Path to the cargo-component binary. Defaults to "cargo-component" (relies on PATH).
+    /// Set to the full path when running as a daemon without ~/.cargo/bin on PATH.
+    #[serde(default = "default_cargo_component_bin")]
+    pub cargo_component_bin: String,
 }
 
 fn default_language() -> String {
@@ -82,6 +223,9 @@ fn default_language() -> String {
 }
 fn default_tier() -> String {
     "standard".into()
+}
+fn default_cargo_component_bin() -> String {
+    "cargo-component".into()
 }
 
 impl GirtConfig {

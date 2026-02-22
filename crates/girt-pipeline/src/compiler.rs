@@ -6,6 +6,9 @@ use crate::error::PipelineError;
 const DEFAULT_WIT: &str = r#"package girt:tool;
 
 world girt-tool {
+    import wasi:http/outgoing-handler@0.2.0;
+    import wasi:clocks/monotonic-clock@0.2.0;
+
     export run: func(input: string) -> result<string, string>;
 }
 "#;

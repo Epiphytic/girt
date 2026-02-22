@@ -47,3 +47,5 @@ url = "ghcr.io/epiphytic/girt-tools"
 [build]
 default_language = "rust"
 default_tier = "standard"
+# Full path needed when girt runs as a daemon without ~/.cargo/bin on PATH
+cargo_component_bin = "/home/openclaw/.cargo/bin/cargo-component"

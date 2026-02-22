@@ -34,6 +34,8 @@ pub struct GirtProxy {
     max_iterations: u32,
     /// What to do when the iteration limit is reached with blocking tickets remaining.
     circuit_breaker_policy: girt_pipeline::config::CircuitBreakerPolicy,
+    /// Path to the cargo-component binary.
+    cargo_component_bin: String,
     /// Server peer for sending tools/list_changed notifications.
     server_peer: Arc<Mutex<Option<Peer<RoleServer>>>>,
 }
@@ -47,6 +49,7 @@ impl GirtProxy {
         coding_standards: Option<String>,
         max_iterations: u32,
         circuit_breaker_policy: girt_pipeline::config::CircuitBreakerPolicy,
+        cargo_component_bin: String,
     ) -> Self {
         Self {
             engine,
@@ -56,6 +59,7 @@ impl GirtProxy {
             coding_standards,
             max_iterations,
             circuit_breaker_policy,
+            cargo_component_bin,
             server_peer: Arc::new(Mutex::new(None)),
         }
     }
@@ -439,7 +443,8 @@ impl GirtProxy {
                     tool_name: artifact.spec.name.clone(),
                     tool_version: "0.1.0".into(),
                 };
-                let compiler = girt_pipeline::compiler::WasmCompiler::new();
+                let compiler = girt_pipeline::compiler::WasmCompiler::new()
+                    .with_bin(&self.cargo_component_bin);
 
                 match compiler.compile(&compile_input).await {
                     Ok(compiled) => {

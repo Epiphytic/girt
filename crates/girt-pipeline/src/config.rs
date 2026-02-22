@@ -132,6 +132,10 @@ pub struct BuildConfig {
     pub default_language: String,
     #[serde(default = "default_tier")]
     pub default_tier: String,
+    /// Path to the cargo-component binary. Defaults to "cargo-component" (relies on PATH).
+    /// Set to the full path when running as a daemon without ~/.cargo/bin on PATH.
+    #[serde(default = "default_cargo_component_bin")]
+    pub cargo_component_bin: String,
 }
 
 fn default_language() -> String {
@@ -139,6 +143,9 @@ fn default_language() -> String {
 }
 fn default_tier() -> String {
     "standard".into()
+}
+fn default_cargo_component_bin() -> String {
+    "cargo-component".into()
 }
 
 impl GirtConfig {

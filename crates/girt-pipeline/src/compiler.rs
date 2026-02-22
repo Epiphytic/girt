@@ -33,6 +33,13 @@ impl WasmCompiler {
         }
     }
 
+    /// Override the path to the cargo-component binary.
+    /// Useful when `~/.cargo/bin` is not on PATH (common in daemon contexts).
+    pub fn with_bin(mut self, path: impl Into<String>) -> Self {
+        self.cargo_component_bin = path.into();
+        self
+    }
+
     pub fn scaffold_project(
         &self,
         input: &CompileInput,

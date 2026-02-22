@@ -102,9 +102,15 @@ def main():
     send(proc, {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
                 "params": {"name": "request_capability", "arguments": spec}})
 
-    # Wait up to 10 minutes (Creation Gate + approval + build)
+    # Approval can take up to 3 days (girt.toml: overall_timeout_secs=259200).
+    # Build after approval can take up to 1 hour (build_timeout_secs=3600).
+    # Approval wait time does NOT count against the build limit.
+    # Use a ceiling that covers worst case: 3 days + 1 hour + 10 min buffer.
+    APPROVAL_WINDOW_SECS = 259_200  # 3 days
+    BUILD_WINDOW_SECS    =   3_600  # 1 hour
+    RECV_TIMEOUT = APPROVAL_WINDOW_SECS + BUILD_WINDOW_SECS + 600
     start = time.time()
-    result = recv(timeout=600)
+    result = recv(timeout=RECV_TIMEOUT)
     elapsed = time.time() - start
     print(f"[bel] Got response in {elapsed:.1f}s", flush=True)
 
